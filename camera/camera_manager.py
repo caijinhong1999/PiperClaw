@@ -2,19 +2,13 @@
 """
 camera_manager.py
 
-统一管理 RGB-D 相机输入，当前以 Orbbec 相机为主。
-提供以下能力：
-1. 初始化相机
-2. 启动/停止数据流
-3. 获取 RGB + Depth 帧
-4. 获取相机内参
-5. 获取指定像素点深度
-6. 调试可视化
+当前版本目标：
+1. 先稳定跑通 Orbbec DaBai 的 RGB
+2. 默认不启用 depth，避免 USB2.0 + profile 不匹配导致启动失败
+3. 后续再单独调通 depth profile
 
-推荐目录：
-robot_project/
-└── camera/
-    └── camera_manager.py
+运行：
+    python camera/camera_manager.py
 """
 
 from __future__ import annotations
@@ -45,7 +39,6 @@ except Exception:
 
 @dataclass
 class CameraIntrinsics:
-    """相机内参"""
     width: int
     height: int
     fx: float
@@ -56,7 +49,6 @@ class CameraIntrinsics:
 
 @dataclass
 class FrameBundle:
-    """单次取帧结果"""
     rgb: Optional[np.ndarray]
     depth: Optional[np.ndarray]
     timestamp: float
@@ -65,28 +57,10 @@ class FrameBundle:
 
 
 class CameraError(Exception):
-    """相机相关异常"""
     pass
 
 
 class CameraManager:
-    """
-    RGB-D 相机管理器（优先面向 Orbbec）。
-
-    用法示例：
-        cam = CameraManager()
-        cam.start()
-
-        frame = cam.get_frame()
-        rgb = frame.rgb
-        depth = frame.depth
-
-        intr = cam.get_intrinsics()
-        z = cam.get_depth_at_pixel(depth, 320, 240)
-
-        cam.stop()
-    """
-
     def __init__(
         self,
         color_width: int = 640,
@@ -96,7 +70,7 @@ class CameraManager:
         depth_height: int = 480,
         depth_fps: int = 30,
         enable_color: bool = True,
-        enable_depth: bool = True,
+        enable_depth: bool = False,   # 先默认关掉 depth
         align_to_color: bool = False,
         device_index: int = 0,
         auto_start: bool = False,
@@ -129,15 +103,12 @@ class CameraManager:
     # 生命周期
     # =========================
     def start(self) -> None:
-        """启动相机流"""
         with self._lock:
             if self._started:
                 return
 
             if Pipeline is None or Config is None:
-                raise CameraError(
-                    "未检测到 pyorbbecsdk，请先正确安装 SDK，或修改 camera_manager.py 顶部 import。"
-                )
+                raise CameraError("未检测到 pyorbbecsdk，请先确认环境安装正确。")
 
             try:
                 self._ctx = Context() if Context is not None else None
@@ -166,7 +137,7 @@ class CameraManager:
                     )
                     self._config.enable_stream(depth_profile)
 
-                # 当前设备大概率不支持 frame sync，默认不要开
+                # 你的设备当前不支持 frame sync，默认不要开
                 if self.align_to_color:
                     try:
                         self._pipeline.enable_frame_sync()
@@ -175,7 +146,6 @@ class CameraManager:
 
                 self._pipeline.start(self._config)
                 self._started = True
-
                 self._warmup_and_cache()
 
             except Exception as e:
@@ -183,7 +153,6 @@ class CameraManager:
                 raise CameraError(f"启动相机失败: {e}") from e
 
     def stop(self) -> None:
-        """停止相机流"""
         with self._lock:
             if not self._started:
                 return
@@ -207,10 +176,6 @@ class CameraManager:
     # 取帧
     # =========================
     def get_frame(self, timeout_ms: int = 1000) -> FrameBundle:
-        """
-        获取一帧 RGB + Depth。
-        depth 返回 float32，单位米。
-        """
         if not self._started:
             raise CameraError("相机尚未启动，请先调用 start()")
 
@@ -259,10 +224,6 @@ class CameraManager:
     # 内参与深度
     # =========================
     def get_intrinsics(self) -> CameraIntrinsics:
-        """
-        获取彩色相机内参。
-        如果拿不到彩色内参，可按需要改成深度内参。
-        """
         if self._cached_intrinsics is not None:
             return self._cached_intrinsics
 
@@ -304,15 +265,17 @@ class CameraManager:
             self._cached_intrinsics = intr
             return intr
 
-        except Exception as e:
-            raise CameraError(f"获取相机内参失败: {e}") from e
+        except Exception:
+            # 有些设备/模式下拿 profile intrinsic 会失败
+            # 先给出一个友好的报错，不让程序崩得太难看
+            raise CameraError("获取相机内参失败：当前 profile 下 SDK 没返回可用内参")
 
     def get_depth_scale(self) -> float:
-        """
-        获取深度尺度，返回“原始深度值 * scale = 米”。
-        """
         if self._depth_scale is not None:
             return self._depth_scale
+
+        if not self.enable_depth:
+            raise CameraError("当前未启用 depth")
 
         if not self._started:
             raise CameraError("相机尚未启动，无法获取深度尺度")
@@ -349,7 +312,6 @@ class CameraManager:
             raise CameraError(f"获取深度尺度失败: {e}") from e
 
     def get_depth_at_pixel(self, depth_image: np.ndarray, u: int, v: int) -> float:
-        """获取某像素点深度值，单位米。"""
         if depth_image is None:
             return 0.0
 
@@ -371,7 +333,6 @@ class CameraManager:
         v: int,
         kernel_size: int = 5,
     ) -> float:
-        """中心像素无效时，在邻域内取中位数深度。"""
         if depth_image is None:
             return 0.0
 
@@ -400,7 +361,6 @@ class CameraManager:
         show_depth_colormap: bool = True,
         window_name: str = "Camera Debug",
     ) -> None:
-        """调试显示单帧。"""
         if frame is None:
             frame = self.get_frame()
 
@@ -436,7 +396,6 @@ class CameraManager:
 
     @staticmethod
     def depth_to_colormap(depth_meters: np.ndarray, max_depth: float = 2.0) -> np.ndarray:
-        """将深度图转成伪彩色图。"""
         depth = depth_meters.copy()
         depth = np.clip(depth, 0, max_depth)
         depth_u8 = (depth / max_depth * 255.0).astype(np.uint8)
@@ -453,7 +412,6 @@ class CameraManager:
         depth_z: float,
         intrinsics: CameraIntrinsics,
     ) -> Tuple[float, float, float]:
-        """像素坐标 + 深度 -> 相机坐标系 3D 点（单位：米）"""
         if depth_z <= 0:
             return 0.0, 0.0, 0.0
 
@@ -466,23 +424,17 @@ class CameraManager:
     # 内部工具函数
     # =========================
     def _warmup_and_cache(self, warmup_frames: int = 5) -> None:
-        """启动后预热几帧，并缓存内参与深度尺度。"""
         for _ in range(warmup_frames):
             try:
                 self._pipeline.wait_for_frames(500)
             except Exception:
                 pass
 
-        try:
-            if self.enable_depth:
+        if self.enable_depth:
+            try:
                 _ = self.get_depth_scale()
-        except Exception:
-            pass
-
-        try:
-            _ = self.get_intrinsics()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     def _select_video_profile(
         self,
@@ -494,48 +446,63 @@ class CameraManager:
         fps: int,
     ) -> Any:
         """
-        适配当前这版 pyorbbecsdk：
-            pipeline.get_stream_profile_list(sensor_type)
+        当前策略：
+        1. 优先取默认 profile（最稳）
+        2. 再尝试指定 profile
         """
         try:
             profile_list = pipeline.get_stream_profile_list(sensor_type)
         except Exception as e:
-            raise CameraError(
-                f"获取 {sensor_type} 的 stream profile list 失败: {e}"
-            ) from e
+            raise CameraError(f"获取 {sensor_type} 的 stream profile list 失败: {e}") from e
 
+        # 最稳：先取默认 profile
+        try:
+            return profile_list.get_default_video_stream_profile()
+        except Exception:
+            pass
+
+        # 再尝试精确匹配
         try:
             return profile_list.get_video_stream_profile(width, height, fmt, fps)
         except Exception:
             pass
 
-        try:
-            return profile_list.get_default_video_stream_profile()
-        except Exception as e:
-            raise CameraError(
-                f"无法选择流配置: sensor={sensor_type}, "
-                f"size={width}x{height}, fps={fps}, fmt={fmt}, err={e}"
-            ) from e
+        raise CameraError(f"{sensor_type} 没有可用 profile")
 
     def _convert_color_frame_to_bgr(self, color_frame: Any) -> np.ndarray:
-        """将 SDK 彩色帧转为 OpenCV BGR 图像。"""
         width = int(color_frame.get_width())
         height = int(color_frame.get_height())
         data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
 
+        # RGB888
         expected_rgb = width * height * 3
         if data.size == expected_rgb:
             rgb = data.reshape((height, width, 3))
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             return bgr
 
+        # BGRA
+        expected_bgra = width * height * 4
+        if data.size == expected_bgra:
+            bgra = data.reshape((height, width, 4))
+            bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+            return bgr
+
+        # YUYV
+        expected_yuyv = width * height * 2
+        if data.size == expected_yuyv:
+            yuyv = data.reshape((height, width, 2))
+            bgr = cv2.cvtColor(yuyv, cv2.COLOR_YUV2BGR_YUY2)
+            return bgr
+
+        # MJPG / JPEG
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if img is None:
-            raise CameraError("彩色帧解码失败，可能格式不是 RGB888/MJPG")
-        return img
+        if img is not None:
+            return img
+
+        raise CameraError("彩色帧解码失败，当前格式未适配")
 
     def _convert_depth_frame_to_meters(self, depth_frame: Any) -> np.ndarray:
-        """将深度帧统一转换为 float32 米单位深度图。"""
         width = int(depth_frame.get_width())
         height = int(depth_frame.get_height())
         data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
@@ -548,13 +515,11 @@ class CameraManager:
 
         depth_raw = data.reshape((height, width))
         scale = self.get_depth_scale()
-
         depth_m = depth_raw.astype(np.float32) * scale
         return depth_m
 
     @staticmethod
     def _safe_get_timestamp(frame: Any) -> Optional[float]:
-        """兼容不同 SDK 的时间戳接口。"""
         try:
             return float(frame.get_timestamp())
         except Exception:
@@ -573,7 +538,7 @@ if __name__ == "__main__":
         depth_height=480,
         depth_fps=30,
         enable_color=True,
-        enable_depth=True,
+        enable_depth=False,   # 先只跑 RGB
         align_to_color=False,
     )
 
@@ -581,23 +546,18 @@ if __name__ == "__main__":
         cam.start()
         print("相机启动成功")
 
-        intr = cam.get_intrinsics()
-        print("相机内参:", intr)
-
         frame = cam.get_frame()
         print("rgb shape:", None if frame.rgb is None else frame.rgb.shape)
         print("depth shape:", None if frame.depth is None else frame.depth.shape)
 
-        if frame.depth is not None:
-            h, w = frame.depth.shape
-            u, v = w // 2, h // 2
-            z = cam.get_valid_depth_near_pixel(frame.depth, u, v)
-            print(f"中心点深度: ({u}, {v}) -> {z:.4f} m")
+        # 先不强制取内参，避免当前 profile 下 SDK 不返回内参导致退出
+        try:
+            intr = cam.get_intrinsics()
+            print("相机内参:", intr)
+        except Exception as e:
+            print("内参暂时获取失败:", e)
 
-            xyz = cam.pixel_to_camera(u, v, z, intr)
-            print("中心点相机坐标:", xyz)
-
-        # 远程 Linux / SSH 先不要开窗口
+        # 远程 SSH 环境先别弹窗
         # cam.visualize_once(frame)
 
     except Exception as e:
