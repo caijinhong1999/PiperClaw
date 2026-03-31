@@ -160,11 +160,9 @@ class CameraManager:
                 self._pipeline = Pipeline()
                 self._config = Config()
 
-                profile_list = self._pipeline.get_stream_profile_list()
-
                 if self.enable_color:
                     color_profile = self._select_video_profile(
-                        profile_list=profile_list,
+                        pipeline=self._pipeline,
                         sensor_type=OBSensorType.COLOR_SENSOR,
                         width=self.color_width,
                         height=self.color_height,
@@ -175,7 +173,7 @@ class CameraManager:
 
                 if self.enable_depth:
                     depth_profile = self._select_video_profile(
-                        profile_list=profile_list,
+                        pipeline=self._pipeline,
                         sensor_type=OBSensorType.DEPTH_SENSOR,
                         width=self.depth_width,
                         height=self.depth_height,
