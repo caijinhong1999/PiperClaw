@@ -3,9 +3,10 @@
 camera_manager.py
 
 当前版本目标：
-1. 先稳定跑通 Orbbec DaBai 的 RGB
-2. 默认不启用 depth，避免 USB2.0 + profile 不匹配导致启动失败
-3. 后续再单独调通 depth profile
+1. 稳定跑通 Orbbec DaBai 的 RGB
+2. 优先使用用户指定的彩色 profile（例如 640x480@30）
+3. 默认不启用 depth，避免 USB2.0 + depth profile 不匹配导致失败
+4. 为后续单独调通 depth 保留接口
 
 运行：
     python camera/camera_manager.py
@@ -95,6 +96,8 @@ class CameraManager:
 
         self._cached_intrinsics: Optional[CameraIntrinsics] = None
         self._depth_scale: Optional[float] = None
+        self._active_color_profile = None
+        self._active_depth_profile = None
 
         if auto_start:
             self.start()
@@ -124,6 +127,7 @@ class CameraManager:
                         fmt=OBFormat.RGB,
                         fps=self.color_fps,
                     )
+                    self._active_color_profile = color_profile
                     self._config.enable_stream(color_profile)
 
                 if self.enable_depth:
@@ -135,9 +139,10 @@ class CameraManager:
                         fmt=OBFormat.Y16,
                         fps=self.depth_fps,
                     )
+                    self._active_depth_profile = depth_profile
                     self._config.enable_stream(depth_profile)
 
-                # 你的设备当前不支持 frame sync，默认不要开
+                # 当前设备不支持 frame sync，默认不要开
                 if self.align_to_color:
                     try:
                         self._pipeline.enable_frame_sync()
@@ -168,6 +173,8 @@ class CameraManager:
                 self._ctx = None
                 self._cached_intrinsics = None
                 self._depth_scale = None
+                self._active_color_profile = None
+                self._active_depth_profile = None
 
     def is_started(self) -> bool:
         return self._started
@@ -230,30 +237,12 @@ class CameraManager:
         if not self._started:
             raise CameraError("相机尚未启动，无法获取内参")
 
+        profile = self._active_color_profile if self.enable_color else self._active_depth_profile
+        if profile is None:
+            raise CameraError("当前没有活动的 stream profile，无法获取内参")
+
         try:
-            if self.enable_color:
-                profile = self._select_video_profile(
-                    pipeline=self._pipeline,
-                    sensor_type=OBSensorType.COLOR_SENSOR,
-                    width=self.color_width,
-                    height=self.color_height,
-                    fmt=OBFormat.RGB,
-                    fps=self.color_fps,
-                )
-            elif self.enable_depth:
-                profile = self._select_video_profile(
-                    pipeline=self._pipeline,
-                    sensor_type=OBSensorType.DEPTH_SENSOR,
-                    width=self.depth_width,
-                    height=self.depth_height,
-                    fmt=OBFormat.Y16,
-                    fps=self.depth_fps,
-                )
-            else:
-                raise CameraError("未启用任何流，无法获取内参")
-
             intrinsic = profile.get_intrinsic()
-
             intr = CameraIntrinsics(
                 width=int(intrinsic.width),
                 height=int(intrinsic.height),
@@ -264,10 +253,7 @@ class CameraManager:
             )
             self._cached_intrinsics = intr
             return intr
-
         except Exception:
-            # 有些设备/模式下拿 profile intrinsic 会失败
-            # 先给出一个友好的报错，不让程序崩得太难看
             raise CameraError("获取相机内参失败：当前 profile 下 SDK 没返回可用内参")
 
     def get_depth_scale(self) -> float:
@@ -447,27 +433,66 @@ class CameraManager:
     ) -> Any:
         """
         当前策略：
-        1. 优先取默认 profile（最稳）
-        2. 再尝试指定 profile
+        1. 优先尝试用户指定 profile
+        2. 再尝试常见彩色格式候选
+        3. 最后回退默认 profile
         """
         try:
             profile_list = pipeline.get_stream_profile_list(sensor_type)
         except Exception as e:
             raise CameraError(f"获取 {sensor_type} 的 stream profile list 失败: {e}") from e
 
-        # 最稳：先取默认 profile
-        try:
-            return profile_list.get_default_video_stream_profile()
-        except Exception:
-            pass
-
-        # 再尝试精确匹配
+        # 1) 精确匹配：先用用户想要的
         try:
             return profile_list.get_video_stream_profile(width, height, fmt, fps)
         except Exception:
             pass
 
-        raise CameraError(f"{sensor_type} 没有可用 profile")
+        # 2) 彩色流多试几个常见格式
+        if sensor_type == OBSensorType.COLOR_SENSOR:
+            candidate_formats = [
+                OBFormat.RGB,
+                getattr(OBFormat, "RGB888", None),
+                getattr(OBFormat, "MJPG", None),
+                getattr(OBFormat, "YUYV", None),
+                getattr(OBFormat, "BGRA", None),
+            ]
+            for candidate_fmt in candidate_formats:
+                if candidate_fmt is None:
+                    continue
+                try:
+                    return profile_list.get_video_stream_profile(
+                        width, height, candidate_fmt, fps
+                    )
+                except Exception:
+                    pass
+
+        # 3) depth 流多试几个候选
+        if sensor_type == OBSensorType.DEPTH_SENSOR:
+            candidate_formats = [
+                OBFormat.Y16,
+                getattr(OBFormat, "Y12", None),
+                getattr(OBFormat, "Z16", None),
+            ]
+            for candidate_fmt in candidate_formats:
+                if candidate_fmt is None:
+                    continue
+                try:
+                    return profile_list.get_video_stream_profile(
+                        width, height, candidate_fmt, fps
+                    )
+                except Exception:
+                    pass
+
+        # 4) 最后回退默认
+        try:
+            return profile_list.get_default_video_stream_profile()
+        except Exception:
+            pass
+
+        raise CameraError(
+            f"{sensor_type} 没有可用 profile: width={width}, height={height}, fps={fps}"
+        )
 
     def _convert_color_frame_to_bgr(self, color_frame: Any) -> np.ndarray:
         width = int(color_frame.get_width())
@@ -550,7 +575,6 @@ if __name__ == "__main__":
         print("rgb shape:", None if frame.rgb is None else frame.rgb.shape)
         print("depth shape:", None if frame.depth is None else frame.depth.shape)
 
-        # 先不强制取内参，避免当前 profile 下 SDK 不返回内参导致退出
         try:
             intr = cam.get_intrinsics()
             print("相机内参:", intr)
