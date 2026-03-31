@@ -22,23 +22,11 @@ from __future__ import annotations
 import time
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import cv2
 
-
-# ==========
-# 重要说明
-# ==========
-# 如果你本地安装的是:
-#   from pyorbbecsdk import *
-# 或者:
-#   from pyorbbecsdk2 import *
-# 这里改一下即可。
-#
-# 下面这套写法兼容“官方 Python SDK 风格”的常见接口命名。
-# 如果你实际 SDK 返回字段略有差异，只需要在少数几个位置微调。
 try:
     from pyorbbecsdk import (
         Context,
@@ -46,17 +34,13 @@ try:
         Config,
         OBSensorType,
         OBFormat,
-        VideoStreamProfile,
     )
 except Exception:
-    # 某些环境里类名不一定全都能直接 import 成功
-    # 为了让文件先能被项目引用，这里保底。
     Context = None
     Pipeline = None
     Config = None
     OBSensorType = None
     OBFormat = None
-    VideoStreamProfile = None
 
 
 @dataclass
@@ -182,14 +166,9 @@ class CameraManager:
                     )
                     self._config.enable_stream(depth_profile)
 
-                # 是否做深度对齐到彩色
-                # 某些 SDK 支持 set_align_mode / enable_align
-                # 不同版本接口不同，这里做兼容保护
+                # 当前设备大概率不支持 frame sync，默认不要开
                 if self.align_to_color:
                     try:
-                        # 某些版本是：
-                        # self._config.set_align_mode(OBAlignMode.HW_MODE)
-                        # 或 pipeline.enable_frame_sync()
                         self._pipeline.enable_frame_sync()
                     except Exception:
                         pass
@@ -197,7 +176,6 @@ class CameraManager:
                 self._pipeline.start(self._config)
                 self._started = True
 
-                # 启动后先尝试缓存内参、深度尺度
                 self._warmup_and_cache()
 
             except Exception as e:
@@ -231,13 +209,7 @@ class CameraManager:
     def get_frame(self, timeout_ms: int = 1000) -> FrameBundle:
         """
         获取一帧 RGB + Depth。
-
-        返回：
-            FrameBundle(
-                rgb=np.ndarray(H, W, 3) / None,
-                depth=np.ndarray(H, W) / None,   # 建议统一为 float32，单位米
-                timestamp=float
-            )
+        depth 返回 float32，单位米。
         """
         if not self._started:
             raise CameraError("相机尚未启动，请先调用 start()")
@@ -252,7 +224,6 @@ class CameraManager:
             rgb_ts = None
             depth_ts = None
 
-            # 彩色帧
             if self.enable_color:
                 try:
                     color_frame = frames.get_color_frame()
@@ -262,7 +233,6 @@ class CameraManager:
                 except Exception as e:
                     raise CameraError(f"解析彩色帧失败: {e}") from e
 
-            # 深度帧
             if self.enable_depth:
                 try:
                     depth_frame = frames.get_depth_frame()
@@ -300,11 +270,9 @@ class CameraManager:
             raise CameraError("相机尚未启动，无法获取内参")
 
         try:
-            profile_list = self._pipeline.get_stream_profile_list()
-
             if self.enable_color:
                 profile = self._select_video_profile(
-                    profile_list=profile_list,
+                    pipeline=self._pipeline,
                     sensor_type=OBSensorType.COLOR_SENSOR,
                     width=self.color_width,
                     height=self.color_height,
@@ -313,7 +281,7 @@ class CameraManager:
                 )
             elif self.enable_depth:
                 profile = self._select_video_profile(
-                    profile_list=profile_list,
+                    pipeline=self._pipeline,
                     sensor_type=OBSensorType.DEPTH_SENSOR,
                     width=self.depth_width,
                     height=self.depth_height,
@@ -323,7 +291,6 @@ class CameraManager:
             else:
                 raise CameraError("未启用任何流，无法获取内参")
 
-            # 常见 SDK 接口：profile.get_intrinsic()
             intrinsic = profile.get_intrinsic()
 
             intr = CameraIntrinsics(
@@ -343,8 +310,6 @@ class CameraManager:
     def get_depth_scale(self) -> float:
         """
         获取深度尺度，返回“原始深度值 * scale = 米”。
-        有些 SDK 直接返回毫米图，有些返回原始 uint16 深度单位。
-        这里做统一。
         """
         if self._depth_scale is not None:
             return self._depth_scale
@@ -353,8 +318,6 @@ class CameraManager:
             raise CameraError("相机尚未启动，无法获取深度尺度")
 
         try:
-            # 常见做法：从 depth frame / profile / sensor 获取
-            # 这里采用“取一帧后读 depth_scale”的兼容方式
             frames = self._pipeline.wait_for_frames(1000)
             if frames is None:
                 raise CameraError("无法获取深度尺度：取帧失败")
@@ -365,20 +328,17 @@ class CameraManager:
 
             scale = None
 
-            # 常见接口 1
             try:
                 scale = depth_frame.get_depth_scale()
             except Exception:
                 pass
 
-            # 常见接口 2：有些版本在 frame 的 value scale 里
             if scale is None:
                 try:
                     scale = depth_frame.get_value_scale()
                 except Exception:
                     pass
 
-            # 保底：很多设备默认毫米 -> 米
             if scale is None:
                 scale = 0.001
 
@@ -389,10 +349,7 @@ class CameraManager:
             raise CameraError(f"获取深度尺度失败: {e}") from e
 
     def get_depth_at_pixel(self, depth_image: np.ndarray, u: int, v: int) -> float:
-        """
-        获取某像素点深度值（单位：米）。
-        如果该点无效，返回 0.0
-        """
+        """获取某像素点深度值，单位米。"""
         if depth_image is None:
             return 0.0
 
@@ -414,10 +371,7 @@ class CameraManager:
         v: int,
         kernel_size: int = 5,
     ) -> float:
-        """
-        当中心像素深度无效时，在邻域内找一个较稳健的深度值。
-        返回中位数深度（米）。
-        """
+        """中心像素无效时，在邻域内取中位数深度。"""
         if depth_image is None:
             return 0.0
 
@@ -446,10 +400,7 @@ class CameraManager:
         show_depth_colormap: bool = True,
         window_name: str = "Camera Debug",
     ) -> None:
-        """
-        调试显示单帧。
-        按任意键继续。
-        """
+        """调试显示单帧。"""
         if frame is None:
             frame = self.get_frame()
 
@@ -471,7 +422,6 @@ class CameraManager:
         if len(vis) == 1:
             canvas = vis[0]
         else:
-            # 统一高度后横向拼接
             target_h = min(img.shape[0] for img in vis)
             resized = []
             for img in vis:
@@ -486,9 +436,7 @@ class CameraManager:
 
     @staticmethod
     def depth_to_colormap(depth_meters: np.ndarray, max_depth: float = 2.0) -> np.ndarray:
-        """
-        将深度图（米）转成伪彩色图，便于调试显示。
-        """
+        """将深度图转成伪彩色图。"""
         depth = depth_meters.copy()
         depth = np.clip(depth, 0, max_depth)
         depth_u8 = (depth / max_depth * 255.0).astype(np.uint8)
@@ -505,9 +453,7 @@ class CameraManager:
         depth_z: float,
         intrinsics: CameraIntrinsics,
     ) -> Tuple[float, float, float]:
-        """
-        像素坐标 + 深度 -> 相机坐标系 3D 点（单位：米）
-        """
+        """像素坐标 + 深度 -> 相机坐标系 3D 点（单位：米）"""
         if depth_z <= 0:
             return 0.0, 0.0, 0.0
 
@@ -520,9 +466,7 @@ class CameraManager:
     # 内部工具函数
     # =========================
     def _warmup_and_cache(self, warmup_frames: int = 5) -> None:
-        """
-        启动后预热几帧，并缓存内参与深度尺度。
-        """
+        """启动后预热几帧，并缓存内参与深度尺度。"""
         for _ in range(warmup_frames):
             try:
                 self._pipeline.wait_for_frames(500)
@@ -530,7 +474,8 @@ class CameraManager:
                 pass
 
         try:
-            _ = self.get_depth_scale() if self.enable_depth else None
+            if self.enable_depth:
+                _ = self.get_depth_scale()
         except Exception:
             pass
 
@@ -541,7 +486,7 @@ class CameraManager:
 
     def _select_video_profile(
         self,
-        profile_list: Any,
+        pipeline: Any,
         sensor_type: Any,
         width: int,
         height: int,
@@ -549,28 +494,23 @@ class CameraManager:
         fps: int,
     ) -> Any:
         """
-        选择视频流配置。
-        不同 pyorbbecsdk 版本接口略有差异，这里做几层兼容。
+        适配当前这版 pyorbbecsdk：
+            pipeline.get_stream_profile_list(sensor_type)
         """
         try:
-            # 常见接口
-            return profile_list.get_video_stream_profile(
-                sensor_type, width, height, fmt, fps
-            )
+            profile_list = pipeline.get_stream_profile_list(sensor_type)
+        except Exception as e:
+            raise CameraError(
+                f"获取 {sensor_type} 的 stream profile list 失败: {e}"
+            ) from e
+
+        try:
+            return profile_list.get_video_stream_profile(width, height, fmt, fps)
         except Exception:
             pass
 
         try:
-            # 某些版本先拿 sensor profile list
-            sensor_profiles = profile_list.get_stream_profile_list(sensor_type)
-            return sensor_profiles.get_video_stream_profile(width, height, fmt, fps)
-        except Exception:
-            pass
-
-        try:
-            # 再保底：取默认 profile
-            sensor_profiles = profile_list.get_stream_profile_list(sensor_type)
-            return sensor_profiles.get_default_video_stream_profile()
+            return profile_list.get_default_video_stream_profile()
         except Exception as e:
             raise CameraError(
                 f"无法选择流配置: sensor={sensor_type}, "
@@ -578,30 +518,24 @@ class CameraManager:
             ) from e
 
     def _convert_color_frame_to_bgr(self, color_frame: Any) -> np.ndarray:
-        """
-        将 SDK 彩色帧转为 OpenCV BGR 图像。
-        """
+        """将 SDK 彩色帧转为 OpenCV BGR 图像。"""
         width = int(color_frame.get_width())
         height = int(color_frame.get_height())
         data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
 
-        # 常见情况：RGB888
         expected_rgb = width * height * 3
         if data.size == expected_rgb:
             rgb = data.reshape((height, width, 3))
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             return bgr
 
-        # 少数情况：MJPG / 其他压缩格式
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if img is None:
             raise CameraError("彩色帧解码失败，可能格式不是 RGB888/MJPG")
         return img
 
     def _convert_depth_frame_to_meters(self, depth_frame: Any) -> np.ndarray:
-        """
-        将深度帧统一转换为 float32 米单位深度图。
-        """
+        """将深度帧统一转换为 float32 米单位深度图。"""
         width = int(depth_frame.get_width())
         height = int(depth_frame.get_height())
         data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
@@ -620,9 +554,7 @@ class CameraManager:
 
     @staticmethod
     def _safe_get_timestamp(frame: Any) -> Optional[float]:
-        """
-        兼容不同 SDK 的时间戳接口。
-        """
+        """兼容不同 SDK 的时间戳接口。"""
         try:
             return float(frame.get_timestamp())
         except Exception:
@@ -633,10 +565,6 @@ class CameraManager:
 
 
 if __name__ == "__main__":
-    """
-    本文件直接运行可用于相机连通性测试：
-        python camera_manager.py
-    """
     cam = CameraManager(
         color_width=640,
         color_height=480,
@@ -669,7 +597,8 @@ if __name__ == "__main__":
             xyz = cam.pixel_to_camera(u, v, z, intr)
             print("中心点相机坐标:", xyz)
 
-        cam.visualize_once(frame)
+        # 远程 Linux / SSH 先不要开窗口
+        # cam.visualize_once(frame)
 
     except Exception as e:
         print("运行失败:", e)
