@@ -33,6 +33,7 @@ try:
         Config,
         OBSensorType,
         OBFormat,
+        OBAlignMode,
     )
 except Exception:
     Context = None
@@ -40,6 +41,7 @@ except Exception:
     Config = None
     OBSensorType = None
     OBFormat = None
+    OBAlignMode = None
 
 
 def _safe_print(*args, **kwargs) -> None:
@@ -169,7 +171,11 @@ class CameraManager:
                     self._active_depth_profile = depth_profile
                     self._config.enable_stream(depth_profile)
 
-                # 某些设备不支持 frame sync，这里只尝试，不致命
+                # D2C / align (SDK-dependent). Must be set on Config before pipeline.start().
+                if self.align_to_color and self.enable_color and self.enable_depth:
+                    self._try_enable_d2c_align()
+
+                # 某些设备不支持 frame sync，这里只尝试，不致命（时间对齐≠几何对齐）
                 if self.align_to_color:
                     try:
                         self._pipeline.enable_frame_sync()
@@ -178,6 +184,16 @@ class CameraManager:
 
                 self._pipeline.start(self._config)
                 self._started = True
+
+                # Try fetch camera param once after start (Pipeline-level API in pyorbbecsdk 1.3.1)
+                try:
+                    cam_param = getattr(self._pipeline, "get_camera_param", None)
+                    if callable(cam_param):
+                        self._try_cache_from_camera_param_object(cam_param())
+                except Exception as e:
+                    # matches user's log: "Can not find matched camera param!"
+                    if self._debug_sdk:
+                        _safe_print(f"[OB_SDK_DEBUG] get_camera_param failed: {e}")
 
                 if self._debug_sdk and not self._debug_sdk_done:
                     try:
@@ -588,6 +604,102 @@ class CameraManager:
                 self._cached_intrinsics = intr
             else:
                 self._cached_depth_intrinsics = intr
+
+    def _try_enable_d2c_align(self) -> None:
+        """
+        Enable D2C alignment via Config if SDK exposes it.
+
+        For pyorbbecsdk 1.3.1 (DaBai DCW2), the relevant methods are:
+        - Config.set_align_mode(...)
+        - Config.set_d2c_target_resolution(width, height)
+        """
+        if self._config is None:
+            return
+        set_align_mode = getattr(self._config, "set_align_mode", None)
+        set_d2c_target_resolution = getattr(self._config, "set_d2c_target_resolution", None)
+        if not callable(set_align_mode):
+            return
+
+        # target resolution: usually match color stream
+        if callable(set_d2c_target_resolution):
+            try:
+                set_d2c_target_resolution(int(self.color_width), int(self.color_height))
+            except Exception as e:
+                if self._debug_sdk:
+                    _safe_print(f"[OB_SDK_DEBUG] set_d2c_target_resolution failed: {e}")
+
+        mode = self._pick_align_mode()
+        if mode is None:
+            if self._debug_sdk:
+                _safe_print("[OB_SDK_DEBUG] OBAlignMode not available; skip set_align_mode")
+            return
+
+        try:
+            set_align_mode(mode)
+            if self._debug_sdk:
+                _safe_print(f"[OB_SDK_DEBUG] set_align_mode={mode}")
+        except Exception as e:
+            if self._debug_sdk:
+                _safe_print(f"[OB_SDK_DEBUG] set_align_mode failed: {e}")
+
+    def _pick_align_mode(self) -> Any:
+        """
+        Best-effort pick of an align mode that aligns depth to color (D2C).
+        Enum member names vary by SDK; we search by keywords.
+        """
+        if OBAlignMode is None:
+            return None
+
+        # try common member name patterns first
+        preferred_names = [
+            "ALIGN_D2C",
+            "D2C",
+            "DEPTH_TO_COLOR",
+            "ALIGN_DEPTH_TO_COLOR",
+            "HW_D2C",
+            "SW_D2C",
+        ]
+        for n in preferred_names:
+            try:
+                if hasattr(OBAlignMode, n):
+                    return getattr(OBAlignMode, n)
+            except Exception:
+                pass
+
+        # generic search in enum attributes
+        try:
+            names = [x for x in dir(OBAlignMode) if x.isupper()]
+        except Exception:
+            names = []
+        # prefer those that mention D2C or COLOR
+        scored = []
+        for name in names:
+            low = name.lower()
+            if "disable" in low or "none" in low:
+                continue
+            score = 0
+            if "d2c" in low:
+                score += 10
+            if "color" in low:
+                score += 5
+            if "depth" in low:
+                score += 2
+            if score > 0:
+                scored.append((score, name))
+        scored.sort(reverse=True)
+        if scored:
+            return getattr(OBAlignMode, scored[0][1])
+
+        # last resort: pick first non-disable
+        for name in names:
+            low = name.lower()
+            if "disable" in low or "none" in low:
+                continue
+            try:
+                return getattr(OBAlignMode, name)
+            except Exception:
+                continue
+        return None
 
     def _debug_sdk_introspection(self, stage: str, obj: Any) -> None:
         """
