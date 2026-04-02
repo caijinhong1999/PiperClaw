@@ -256,6 +256,7 @@ def main():
         enable_color=True,
         enable_depth=use_depth,
         align_to_color=args.align_to_color,
+        latest_only=True,
     )
 
     prev_time = time.time()
@@ -270,6 +271,7 @@ def main():
     try:
         cam.start()
         print("[INFO] camera started")
+        print("[INFO] frame grab: latest-only (后台线程持续取流，减轻 Pipeline 队列满/丢帧)")
 
         intr = cam.get_intrinsics()
         print("[INFO] intrinsics:", intr)

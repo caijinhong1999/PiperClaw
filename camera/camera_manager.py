@@ -8,6 +8,7 @@ camera_manager.py
 3. 默认不启用 depth，避免 USB2.0 + depth profile 不匹配导致失败
 4. 为后续单独调通 depth 保留接口
 5. 对内参获取失败做兜底，避免程序中断
+6. latest_only=True 时由后台线程独占 wait_for_frames，只保留最新帧，减轻「队列满丢帧」
 
 运行：
     python camera/camera_manager.py
@@ -89,6 +90,7 @@ class CameraManager:
         align_to_color: bool = False,
         device_index: int = 0,
         auto_start: bool = False,
+        latest_only: bool = False,
     ) -> None:
         self.color_width = color_width
         self.color_height = color_height
@@ -100,6 +102,7 @@ class CameraManager:
         self.enable_depth = enable_depth
         self.align_to_color = align_to_color
         self.device_index = device_index
+        self._latest_only = latest_only
 
         self._ctx = None
         self._pipeline = None
@@ -107,6 +110,10 @@ class CameraManager:
 
         self._started = False
         self._lock = threading.Lock()
+        self._latest_lock = threading.Lock()
+        self._latest_bundle: Optional[FrameBundle] = None
+        self._grab_stop = threading.Event()
+        self._grab_thread: Optional[threading.Thread] = None
 
         self._cached_intrinsics: Optional[CameraIntrinsics] = None
         self._depth_scale: Optional[float] = None
@@ -165,7 +172,18 @@ class CameraManager:
 
                 self._pipeline.start(self._config)
                 self._started = True
-                self._warmup_and_cache()
+
+                if self._latest_only:
+                    self._grab_stop.clear()
+                    self._latest_bundle = None
+                    self._grab_thread = threading.Thread(
+                        target=self._grab_loop,
+                        name="OrbbecLatestGrab",
+                        daemon=True,
+                    )
+                    self._grab_thread.start()
+                else:
+                    self._warmup_and_cache()
 
             except Exception as e:
                 self._started = False
@@ -182,6 +200,12 @@ class CameraManager:
                 raise CameraError(f"启动相机失败: {e}") from e
 
     def stop(self) -> None:
+        t = self._grab_thread
+        if t is not None:
+            self._grab_stop.set()
+            self._grab_thread = None
+            t.join(timeout=3.0)
+
         with self._lock:
             if not self._started and self._pipeline is None:
                 return
@@ -200,6 +224,8 @@ class CameraManager:
                 self._depth_scale = None
                 self._active_color_profile = None
                 self._active_depth_profile = None
+                with self._latest_lock:
+                    self._latest_bundle = None
 
     def is_started(self) -> bool:
         return self._started
@@ -211,46 +237,84 @@ class CameraManager:
         if not self._started or self._pipeline is None:
             raise CameraError("相机尚未启动，请先调用 start()")
 
+        if self._latest_only:
+            deadline = time.time() + timeout_ms / 1000.0
+            while time.time() < deadline:
+                with self._latest_lock:
+                    if self._latest_bundle is not None:
+                        return self._copy_frame_bundle(self._latest_bundle)
+                time.sleep(0.001)
+            raise CameraError("获取帧超时：尚无可用帧")
+
         try:
             frames = self._pipeline.wait_for_frames(timeout_ms)
             if frames is None:
                 raise CameraError("获取帧失败：wait_for_frames 返回空")
-
-            color_image = None
-            depth_image = None
-            rgb_ts = None
-            depth_ts = None
-
-            if self.enable_color:
-                try:
-                    color_frame = frames.get_color_frame()
-                    if color_frame is not None:
-                        color_image = self._convert_color_frame_to_bgr(color_frame)
-                        rgb_ts = self._safe_get_timestamp(color_frame)
-                except Exception as e:
-                    raise CameraError(f"解析彩色帧失败: {e}") from e
-
-            if self.enable_depth:
-                try:
-                    depth_frame = frames.get_depth_frame()
-                    if depth_frame is not None:
-                        depth_image = self._convert_depth_frame_to_meters(depth_frame)
-                        depth_ts = self._safe_get_timestamp(depth_frame)
-                except Exception as e:
-                    raise CameraError(f"解析深度帧失败: {e}") from e
-
-            return FrameBundle(
-                rgb=color_image,
-                depth=depth_image,
-                timestamp=time.time(),
-                rgb_timestamp=rgb_ts,
-                depth_timestamp=depth_ts,
-            )
+            return self._process_frameset(frames)
 
         except Exception as e:
             if isinstance(e, CameraError):
                 raise
             raise CameraError(f"获取相机帧失败: {e}") from e
+
+    def _grab_loop(self) -> None:
+        while not self._grab_stop.is_set():
+            if not self._started or self._pipeline is None:
+                break
+            try:
+                frames = self._pipeline.wait_for_frames(200)
+                if frames is None:
+                    continue
+                bundle = self._process_frameset(frames)
+                with self._latest_lock:
+                    self._latest_bundle = bundle
+            except Exception:
+                if self._grab_stop.is_set():
+                    break
+                time.sleep(0.001)
+
+    def _copy_frame_bundle(self, bundle: FrameBundle) -> FrameBundle:
+        rgb = bundle.rgb.copy() if bundle.rgb is not None else None
+        depth = bundle.depth.copy() if bundle.depth is not None else None
+        return FrameBundle(
+            rgb=rgb,
+            depth=depth,
+            timestamp=bundle.timestamp,
+            rgb_timestamp=bundle.rgb_timestamp,
+            depth_timestamp=bundle.depth_timestamp,
+        )
+
+    def _process_frameset(self, frames: Any) -> FrameBundle:
+        color_image = None
+        depth_image = None
+        rgb_ts = None
+        depth_ts = None
+
+        if self.enable_color:
+            try:
+                color_frame = frames.get_color_frame()
+                if color_frame is not None:
+                    color_image = self._convert_color_frame_to_bgr(color_frame)
+                    rgb_ts = self._safe_get_timestamp(color_frame)
+            except Exception as e:
+                raise CameraError(f"解析彩色帧失败: {e}") from e
+
+        if self.enable_depth:
+            try:
+                depth_frame = frames.get_depth_frame()
+                if depth_frame is not None:
+                    depth_image = self._convert_depth_frame_to_meters(depth_frame)
+                    depth_ts = self._safe_get_timestamp(depth_frame)
+            except Exception as e:
+                raise CameraError(f"解析深度帧失败: {e}") from e
+
+        return FrameBundle(
+            rgb=color_image,
+            depth=depth_image,
+            timestamp=time.time(),
+            rgb_timestamp=rgb_ts,
+            depth_timestamp=depth_ts,
+        )
 
     # =========================
     # 内参与深度
@@ -288,34 +352,35 @@ class CameraManager:
         except Exception:
             pass
 
-        # 方案2：从当前 frame 对应的 profile 取
-        try:
-            frames = self._pipeline.wait_for_frames(1000)
-            if frames is not None:
-                frame = None
-                if self.enable_color:
-                    frame = frames.get_color_frame()
-                elif self.enable_depth:
-                    frame = frames.get_depth_frame()
+        # 方案2：从当前 frame 对应的 profile 取（latest_only 时由后台线程独占 wait_for_frames，此处不再抢帧）
+        if not self._latest_only:
+            try:
+                frames = self._pipeline.wait_for_frames(1000)
+                if frames is not None:
+                    frame = None
+                    if self.enable_color:
+                        frame = frames.get_color_frame()
+                    elif self.enable_depth:
+                        frame = frames.get_depth_frame()
 
-                if frame is not None:
-                    try:
-                        stream_profile = frame.get_stream_profile()
-                        intrinsic = stream_profile.get_intrinsic()
-                        intr = CameraIntrinsics(
-                            width=int(intrinsic.width),
-                            height=int(intrinsic.height),
-                            fx=float(intrinsic.fx),
-                            fy=float(intrinsic.fy),
-                            cx=float(intrinsic.cx),
-                            cy=float(intrinsic.cy),
-                        )
-                        self._cached_intrinsics = intr
-                        return intr
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    if frame is not None:
+                        try:
+                            stream_profile = frame.get_stream_profile()
+                            intrinsic = stream_profile.get_intrinsic()
+                            intr = CameraIntrinsics(
+                                width=int(intrinsic.width),
+                                height=int(intrinsic.height),
+                                fx=float(intrinsic.fx),
+                                fy=float(intrinsic.fy),
+                                cx=float(intrinsic.cx),
+                                cy=float(intrinsic.cy),
+                            )
+                            self._cached_intrinsics = intr
+                            return intr
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         # 方案3：兜底近似内参
         try:
@@ -352,6 +417,14 @@ class CameraManager:
 
         if not self._started or self._pipeline is None:
             raise CameraError("相机尚未启动，无法获取深度尺度")
+
+        if self._latest_only:
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if self._depth_scale is not None:
+                    return self._depth_scale
+                time.sleep(0.005)
+            raise CameraError("深度尺度尚未就绪：请确认采集线程已输出至少一帧深度")
 
         try:
             frames = self._pipeline.wait_for_frames(1000)
@@ -500,6 +573,8 @@ class CameraManager:
     # =========================
     def _warmup_and_cache(self, warmup_frames: int = 5) -> None:
         if self._pipeline is None:
+            return
+        if self._latest_only:
             return
 
         for _ in range(warmup_frames):
@@ -650,9 +725,29 @@ class CameraManager:
             )
 
         depth_raw = data.reshape((height, width))
-        scale = self.get_depth_scale()
+        scale = self._depth_scale_from_frame(depth_frame)
         depth_m = depth_raw.astype(np.float32) * scale
         return depth_m
+
+    def _depth_scale_from_frame(self, depth_frame: Any) -> float:
+        if self._depth_scale is not None:
+            return self._depth_scale
+
+        scale = None
+        try:
+            scale = depth_frame.get_depth_scale()
+        except Exception:
+            pass
+        if scale is None:
+            try:
+                scale = depth_frame.get_value_scale()
+            except Exception:
+                pass
+        if scale is None:
+            scale = 0.001
+
+        self._depth_scale = float(scale)
+        return self._depth_scale
 
     @staticmethod
     def _safe_get_timestamp(frame: Any) -> Optional[float]:

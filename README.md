@@ -70,7 +70,11 @@ python camera/yolo_grasp_prep_demo.py --model ~/PiperClaw/models/yolov8n.pt
 
 ## YOLO 抓取准备（变化时刷新，`yolo_grasp_prep_on_change_demo.py`）
 
-在 `yolo_grasp_prep_demo.py` 基础上：**仅当最佳目标相对上一次输出发生有意义变化时**才打印 `[TARGET]`（行格式与 grasp_prep 相同）；类别变化、检测从无到有/从有到无、或中心 `(u,v)` 移动超过阈值视为变化。失去最佳目标时会打印 `[INFO] best target cleared (no detection)`。可选 **`--infer-every N`** 每 N 帧做一次 YOLO，以降低 GPU 占用（未推理帧沿用上次框叠画，快速运动时可能略有偏差）。
+在 `yolo_grasp_prep_demo.py` 基础上：**仅当最佳目标相对上一次输出发生有意义变化时**才打印 `[TARGET]`；在 grasp_prep 的字段上增加 **`depth_m`（米）** 与 **`cam_xyz`**（相机坐标系，米）。默认 **开启 RGB + 深度流**；类别变化、检测从无到有/从有到无、或中心 `(u,v)` 移动超过阈值视为变化。失去最佳目标时会打印 `[INFO] best target cleared (no detection)`。可选 **`--infer-every N`** 每 N 帧做一次 YOLO，以降低 GPU 占用（未推理帧沿用上次框叠画，快速运动时可能略有偏差）。
+
+深度与彩色分辨率不一致时会按比例映射采样；几何对齐依赖设备，未做 SDK D2C 时三维可能有偏差。建议 USB3；若开流失败可试 **`--no-depth`** 仅跑 RGB。
+
+本脚本使用 `CameraManager(..., latest_only=True)`：后台线程持续从 SDK 取流并只保留**最新一帧**，主线程每次 `get_frame` 取快照，用于缓解 **`Pipeline ... queue fulled, drop the oldest frame`**（处理慢于采集时）。
 
 依赖与上文相同。
 
@@ -93,5 +97,8 @@ python camera/yolo_grasp_prep_on_change_demo.py --model ~/PiperClaw/models/yolov
 | `--classes` | 只检测指定类别，逗号分隔 | 全部类别 |
 | `--pixel-threshold` | 中心点移动超过该像素才再次输出 `[TARGET]` | `10` |
 | `--infer-every` | 每 N 帧运行一次 YOLO（≥1）；大于 1 可降低推理频率 | `1` |
+| `--no-depth` | 仅 RGB，关闭深度流（`[TARGET]` / `[SAVE]` 不含深度字段） | 默认不加：深度开 |
+| `--align-to-color` | 尝试启用帧同步（设备不支持会忽略） | 否 |
+| `--show-depth-panel` | 额外打开「Depth」窗口显示深度伪彩色 | 否 |
 
-交互：**q** 退出，**s** 保存当前最佳目标，`[SAVE]` 行格式与 `yolo_grasp_prep_demo.py` 一致。
+交互：**q** 退出，**s** 保存当前最佳目标。开启深度时 `[SAVE]` 含 `depth_m` 与 `cam_xyz`；`--no-depth` 时与 `yolo_grasp_prep_demo.py` 的像素/bbox 行格式一致。
