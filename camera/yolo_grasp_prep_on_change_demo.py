@@ -103,6 +103,17 @@ def parse_args():
         help="并排显示深度伪彩色图（小窗 Depth）",
     )
     parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="不显示 OpenCV 窗口（可用于排查/规避 imshow 阻塞导致的高延迟）",
+    )
+    parser.add_argument(
+        "--display-every",
+        type=int,
+        default=1,
+        help="每 N 帧刷新一次窗口显示（>=1），降低 imshow/waitKey 开销",
+    )
+    parser.add_argument(
         "--time-stat",
         action="store_true",
         help="开启耗时统计（取帧/YOLO/画图imshow）",
@@ -241,6 +252,8 @@ def main():
     args = parse_args()
     if args.infer_every < 1:
         raise SystemExit("--infer-every 必须 >= 1")
+    if args.display_every < 1:
+        raise SystemExit("--display-every 必须 >= 1")
 
     target_class_names = set()
     if args.classes.strip():
@@ -289,9 +302,10 @@ def main():
         print("[INFO] depth stream:", "on" if use_depth else "off (--no-depth)")
 
         window_name = "YOLO Grasp Prep (on change)"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        if args.show_depth_panel and use_depth:
-            cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
+        if not args.no_gui:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            if args.show_depth_panel and use_depth:
+                cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
 
         # windowed time stats
         stat_window_frames = 0
@@ -477,16 +491,18 @@ def main():
                         color=(0, 255, 255),
                     )
 
+            key = 255
             t_imshow0 = time.perf_counter()
-            cv2.imshow(window_name, vis)
-            if args.show_depth_panel and use_depth and depth_img is not None:
-                dvis = CameraManager.depth_to_colormap(depth_img)
-                if dvis.shape[0] != vis.shape[0]:
-                    scale = vis.shape[0] / max(dvis.shape[0], 1)
-                    nw = max(1, int(dvis.shape[1] * scale))
-                    dvis = cv2.resize(dvis, (nw, vis.shape[0]))
-                cv2.imshow("Depth", dvis)
-            key = cv2.waitKey(1) & 0xFF
+            if (not args.no_gui) and (frame_index % args.display_every == 0):
+                cv2.imshow(window_name, vis)
+                if args.show_depth_panel and use_depth and depth_img is not None:
+                    dvis = CameraManager.depth_to_colormap(depth_img)
+                    if dvis.shape[0] != vis.shape[0]:
+                        scale = vis.shape[0] / max(dvis.shape[0], 1)
+                        nw = max(1, int(dvis.shape[1] * scale))
+                        dvis = cv2.resize(dvis, (nw, vis.shape[0]))
+                    cv2.imshow("Depth", dvis)
+                key = cv2.waitKey(1) & 0xFF
             t_vis1 = time.perf_counter()
             t_imshow1 = t_vis1
 
