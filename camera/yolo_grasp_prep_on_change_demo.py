@@ -297,8 +297,13 @@ def main():
         stat_window_frames = 0
         stat_grab_s = 0.0
         stat_infer_s = 0.0
-        stat_vis_s = 0.0
+        stat_draw_det_s = 0.0
+        stat_attach_depth_s = 0.0
+        stat_draw_best_s = 0.0
+        stat_print_s = 0.0
+        stat_imshow_s = 0.0
         stat_infer_calls = 0
+        stat_print_calls = 0
 
         while True:
             t_grab0 = time.perf_counter()
@@ -343,10 +348,17 @@ def main():
                 best_target = last_best
             t_infer1 = time.perf_counter()
 
-            # 画图 + 深度采样 + imshow/waitKey
+            # 画图 + 深度采样 + imshow/waitKey（细分计时用于定位延迟）
             t_vis0 = time.perf_counter()
             vis = frame.copy()
             rgb_shape = frame.shape
+            t_draw_det0 = time.perf_counter()
+            t_attach0 = t_vis0
+            t_attach1 = t_vis0
+            t_draw_best0 = t_vis0
+            t_draw_best1 = t_vis0
+            t_print_dur = 0.0
+            t_print_calls = 0
 
             if detections:
                 for det in detections:
@@ -356,8 +368,10 @@ def main():
                     label = f'{det["class_name"]} {det["conf"]:.2f}'
                     safe_put_text(vis, label, (det["x1"], max(25, det["y1"] - 8)))
                     safe_put_text(vis, f'({det["u"]}, {det["v"]})', (det["x1"], min(vis.shape[0] - 10, det["y2"] + 20)), 0.5, 1)
+            t_draw_det1 = time.perf_counter()
 
             if best_target is not None:
+                t_attach0 = time.perf_counter()
                 best_e = attach_depth_and_cam_xyz(
                     best_target,
                     depth_img,
@@ -365,7 +379,9 @@ def main():
                     intr,
                     cam,
                 )
+                t_attach1 = time.perf_counter()
 
+                t_draw_best0 = time.perf_counter()
                 draw_box(
                     vis,
                     best_target["x1"],
@@ -394,10 +410,12 @@ def main():
                         2,
                         color=(255, 0, 0),
                     )
+                t_draw_best1 = time.perf_counter()
 
                 if best_target_changed(published_best, best_target, args.pixel_threshold):
                     published_best = best_e.copy()
                     if use_depth:
+                        t_print0 = time.perf_counter()
                         print(
                             f'[TARGET] class={best_e["class_name"]}, '
                             f'conf={best_e["conf"]:.3f}, '
@@ -406,17 +424,25 @@ def main():
                             f'depth_m={best_e["depth_m"]:.3f}, '
                             f'cam_xyz=({best_e["cam_x"]:.4f}, {best_e["cam_y"]:.4f}, {best_e["cam_z"]:.4f})'
                         )
+                        t_print_dur = time.perf_counter() - t_print0
+                        t_print_calls = 1
                     else:
+                        t_print0 = time.perf_counter()
                         print(
                             f'[TARGET] class={best_target["class_name"]}, '
                             f'conf={best_target["conf"]:.3f}, '
                             f'pixel=({best_target["u"]}, {best_target["v"]}), '
                             f'bbox=({best_target["x1"]}, {best_target["y1"]}, {best_target["x2"]}, {best_target["y2"]})'
                         )
+                        t_print_dur = time.perf_counter() - t_print0
+                        t_print_calls = 1
             else:
                 if published_best is not None:
                     published_best = None
+                    t_print0 = time.perf_counter()
                     print("[INFO] best target cleared (no detection)")
+                    t_print_dur = time.perf_counter() - t_print0
+                    t_print_calls = 1
 
             curr_time = time.time()
             dt = curr_time - prev_time
@@ -451,6 +477,7 @@ def main():
                         color=(0, 255, 255),
                     )
 
+            t_imshow0 = time.perf_counter()
             cv2.imshow(window_name, vis)
             if args.show_depth_panel and use_depth and depth_img is not None:
                 dvis = CameraManager.depth_to_colormap(depth_img)
@@ -461,6 +488,7 @@ def main():
                 cv2.imshow("Depth", dvis)
             key = cv2.waitKey(1) & 0xFF
             t_vis1 = time.perf_counter()
+            t_imshow1 = t_vis1
 
             if key == ord("q"):
                 break
@@ -497,27 +525,54 @@ def main():
                 stat_window_frames += 1
                 stat_grab_s += (t_grab1 - t_grab0)
                 stat_infer_s += (t_infer1 - t_infer0) if run_infer else 0.0
-                stat_vis_s += (t_vis1 - t_vis0)
+                stat_draw_det_s += (t_draw_det1 - t_draw_det0)
+                stat_attach_depth_s += (t_attach1 - t_attach0)
+                stat_draw_best_s += (t_draw_best1 - t_draw_best0)
+                stat_print_s += t_print_dur
+                stat_print_calls += t_print_calls
+                stat_imshow_s += (t_imshow1 - t_imshow0)
                 if run_infer:
                     stat_infer_calls += 1
 
                 if stat_window_frames >= max(1, int(args.time_print_every)):
                     avg_grab = stat_grab_s / stat_window_frames
                     avg_infer = stat_infer_s / stat_window_frames  # averaged per frame
-                    avg_vis = stat_vis_s / stat_window_frames
-                    avg_total = (stat_grab_s + stat_infer_s + stat_vis_s) / stat_window_frames
+                    avg_draw_det = stat_draw_det_s / stat_window_frames
+                    avg_attach = stat_attach_depth_s / stat_window_frames
+                    avg_draw_best = stat_draw_best_s / stat_window_frames
+                    avg_imshow = stat_imshow_s / stat_window_frames
+                    avg_print_total = stat_print_s / stat_window_frames
+                    avg_total = (
+                        stat_grab_s
+                        + stat_infer_s
+                        + stat_draw_det_s
+                        + stat_attach_depth_s
+                        + stat_draw_best_s
+                        + stat_print_s
+                        + stat_imshow_s
+                    ) / stat_window_frames
 
-                    infer_note = f"(infer calls={stat_infer_calls})"
+                    infer_note = f"(infer calls={stat_infer_calls}, print calls={stat_print_calls})"
                     print(
                         f'[TIME] avg per frame: grab={avg_grab*1000:.1f}ms '
-                        f'infer={avg_infer*1000:.1f}ms vis={avg_vis*1000:.1f}ms '
+                        f'infer={avg_infer*1000:.1f}ms '
+                        f'draw_det={avg_draw_det*1000:.1f}ms '
+                        f'attach_depth={avg_attach*1000:.1f}ms '
+                        f'draw_best={avg_draw_best*1000:.1f}ms '
+                        f'imshow={avg_imshow*1000:.1f}ms '
+                        f'print_total={avg_print_total*1000:.1f}ms '
                         f'total={avg_total*1000:.1f}ms {infer_note}'
                     )
                     stat_window_frames = 0
                     stat_grab_s = 0.0
                     stat_infer_s = 0.0
-                    stat_vis_s = 0.0
+                    stat_draw_det_s = 0.0
+                    stat_attach_depth_s = 0.0
+                    stat_draw_best_s = 0.0
+                    stat_print_s = 0.0
+                    stat_imshow_s = 0.0
                     stat_infer_calls = 0
+                    stat_print_calls = 0
 
         cv2.destroyAllWindows()
 
