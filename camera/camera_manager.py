@@ -748,7 +748,16 @@ class CameraManager:
         if scale is None:
             scale = 0.001
 
-        self._depth_scale = float(scale)
+        # 一些设备/后端可能返回 1 或异常大的 scale（导致把 mm 当成 m）
+        # 这里做一个保守兜底：若 scale >= 0.01，则更可能是“原始单位为 mm”，按 0.001m 缩放更合理
+        try:
+            scale_f = float(scale)
+        except Exception:
+            scale_f = 0.001
+        if scale_f >= 0.01:
+            scale_f = 0.001
+
+        self._depth_scale = float(scale_f)
         return self._depth_scale
 
     @staticmethod

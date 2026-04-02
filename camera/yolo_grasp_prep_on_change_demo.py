@@ -120,6 +120,18 @@ def parse_args():
         help="cv2.waitKey 等待毫秒数（用于处理窗口事件；默认 1）",
     )
     parser.add_argument(
+        "--min-depth-m",
+        type=float,
+        default=0.05,
+        help="深度有效下限（米），小于该值视为无效",
+    )
+    parser.add_argument(
+        "--max-depth-m",
+        type=float,
+        default=3.0,
+        help="深度有效上限（米），大于该值视为无效",
+    )
+    parser.add_argument(
         "--time-stat",
         action="store_true",
         help="开启耗时统计（取帧/YOLO/画图imshow）",
@@ -157,6 +169,8 @@ def attach_depth_and_cam_xyz(
     rgb_shape: Tuple[int, ...],
     intr: CameraIntrinsics,
     cam: CameraManager,
+    min_depth_m: float = 0.05,
+    max_depth_m: float = 3.0,
 ) -> Dict[str, Any]:
     """为检测字典附加 depth_m 与 cam_x, cam_y, cam_z（米）。彩色与深度分辨率不同时对 (u,v) 做映射采样。"""
     out = det.copy()
@@ -171,6 +185,9 @@ def attach_depth_and_cam_xyz(
     u, v = int(det["u"]), int(det["v"])
     ud, vd = map_rgb_uv_to_depth_uv(u, v, rgb_shape, depth_image.shape)
     z = cam.get_valid_depth_near_pixel(depth_image, ud, vd, kernel_size=5)
+    z = float(z)
+    if (not np.isfinite(z)) or (z < min_depth_m) or (z > max_depth_m):
+        z = 0.0
     out["depth_m"] = float(z)
 
     if z > 0 and np.isfinite(z):
@@ -400,6 +417,8 @@ def main():
                     rgb_shape,
                     intr,
                     cam,
+                    min_depth_m=args.min_depth_m,
+                    max_depth_m=args.max_depth_m,
                 )
                 t_attach1 = time.perf_counter()
 
@@ -526,6 +545,8 @@ def main():
                         frame.shape,
                         intr,
                         cam,
+                        min_depth_m=args.min_depth_m,
+                        max_depth_m=args.max_depth_m,
                     )
                     saved_target = best_e.copy()
                     if use_depth:
