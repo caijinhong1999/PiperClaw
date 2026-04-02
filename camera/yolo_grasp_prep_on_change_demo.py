@@ -102,6 +102,17 @@ def parse_args():
         action="store_true",
         help="并排显示深度伪彩色图（小窗 Depth）",
     )
+    parser.add_argument(
+        "--time-stat",
+        action="store_true",
+        help="开启耗时统计（取帧/YOLO/画图imshow）",
+    )
+    parser.add_argument(
+        "--time-print-every",
+        type=int,
+        default=30,
+        help="每 N 帧打印一次耗时统计（配合 --time-stat）",
+    )
     return parser.parse_args()
 
 
@@ -282,10 +293,19 @@ def main():
         if args.show_depth_panel and use_depth:
             cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
 
+        # windowed time stats
+        stat_window_frames = 0
+        stat_grab_s = 0.0
+        stat_infer_s = 0.0
+        stat_vis_s = 0.0
+        stat_infer_calls = 0
+
         while True:
+            t_grab0 = time.perf_counter()
             frame_bundle = cam.get_frame(timeout_ms=1000)
             frame = frame_bundle.rgb
             depth_img = frame_bundle.depth if use_depth else None
+            t_grab1 = time.perf_counter()
 
             if frame is None:
                 print("[WARN] empty rgb frame")
@@ -297,6 +317,7 @@ def main():
             detections: List[Dict[str, Any]] = []
             best_target: Optional[Dict[str, Any]] = None
 
+            t_infer0 = time.perf_counter()
             if run_infer:
                 results = model.predict(
                     source=frame,
@@ -320,7 +341,10 @@ def main():
             else:
                 detections = last_detections
                 best_target = last_best
+            t_infer1 = time.perf_counter()
 
+            # 画图 + 深度采样 + imshow/waitKey
+            t_vis0 = time.perf_counter()
             vis = frame.copy()
             rgb_shape = frame.shape
 
@@ -436,6 +460,7 @@ def main():
                     dvis = cv2.resize(dvis, (nw, vis.shape[0]))
                 cv2.imshow("Depth", dvis)
             key = cv2.waitKey(1) & 0xFF
+            t_vis1 = time.perf_counter()
 
             if key == ord("q"):
                 break
@@ -467,6 +492,32 @@ def main():
                         )
                 else:
                     print("[SAVE] no target to save")
+
+            if args.time_stat:
+                stat_window_frames += 1
+                stat_grab_s += (t_grab1 - t_grab0)
+                stat_infer_s += (t_infer1 - t_infer0) if run_infer else 0.0
+                stat_vis_s += (t_vis1 - t_vis0)
+                if run_infer:
+                    stat_infer_calls += 1
+
+                if stat_window_frames >= max(1, int(args.time_print_every)):
+                    avg_grab = stat_grab_s / stat_window_frames
+                    avg_infer = stat_infer_s / stat_window_frames  # averaged per frame
+                    avg_vis = stat_vis_s / stat_window_frames
+                    avg_total = (stat_grab_s + stat_infer_s + stat_vis_s) / stat_window_frames
+
+                    infer_note = f"(infer calls={stat_infer_calls})"
+                    print(
+                        f'[TIME] avg per frame: grab={avg_grab*1000:.1f}ms '
+                        f'infer={avg_infer*1000:.1f}ms vis={avg_vis*1000:.1f}ms '
+                        f'total={avg_total*1000:.1f}ms {infer_note}'
+                    )
+                    stat_window_frames = 0
+                    stat_grab_s = 0.0
+                    stat_infer_s = 0.0
+                    stat_vis_s = 0.0
+                    stat_infer_calls = 0
 
         cv2.destroyAllWindows()
 
