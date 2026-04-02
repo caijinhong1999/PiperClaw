@@ -3,12 +3,13 @@
 yolo_grasp_prep_on_change_demo.py
 
 在 yolo_grasp_prep_demo.py 基础上：
-1. 仅当「当前最佳目标」相对上一次已发布结果发生有意义变化时，才打印 [TARGET]（格式与 grasp_prep 一致）
+1. 仅当「当前最佳目标」相对上一次已发布结果发生有意义变化时，才打印 [TARGET]（在 grasp_prep 格式上增加深度与相机坐标）
 2. 可选每隔 N 帧做一次 YOLO 推理（降低 GPU 占用；未推理帧沿用上次检测框叠画，快速运动时框可能略有偏差）
+3. 默认开启 **RGB + 深度**；在最佳目标中心邻域取深度（米），并换算为相机坐标 (X,Y,Z)m
 
 说明：
-- 延迟主要来自每帧 YOLO 推理与相机管线，而不是终端 print；本脚本主要减少无意义的日志与可选降采样推理
-- 输出仍为 2D 像素坐标
+- 延迟主要来自每帧 YOLO 推理与相机管线，而不是终端 print
+- 深度与彩色分辨率不一致时，会将 (u,v) 映射到深度图再采样；几何对齐依赖设备/SDK，未做 D2C 时可能有偏差
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from camera.camera_manager import CameraManager, CameraError
+from camera.camera_manager import CameraIntrinsics, CameraManager, CameraError
 
 try:
     from ultralytics import YOLO
@@ -86,7 +87,71 @@ def parse_args():
         default=1,
         help="每 N 帧运行一次 YOLO（>=1）；>1 可降低 GPU 负载，未推理帧沿用上次检测结果叠画",
     )
+    parser.add_argument(
+        "--no-depth",
+        action="store_true",
+        help="关闭深度流，仅 RGB（与旧行为一致）",
+    )
+    parser.add_argument(
+        "--align-to-color",
+        action="store_true",
+        help="尝试启用帧同步（设备不支持时会忽略）；部分机型上有利于 RGB/深度时间对齐",
+    )
+    parser.add_argument(
+        "--show-depth-panel",
+        action="store_true",
+        help="并排显示深度伪彩色图（小窗 Depth）",
+    )
     return parser.parse_args()
+
+
+def map_rgb_uv_to_depth_uv(
+    u: int,
+    v: int,
+    rgb_shape: Tuple[int, ...],
+    depth_shape: Tuple[int, ...],
+) -> Tuple[int, int]:
+    """彩色图像素映射到深度图坐标（分辨率不同时按比例）。"""
+    rh, rw = int(rgb_shape[0]), int(rgb_shape[1])
+    dh, dw = int(depth_shape[0]), int(depth_shape[1])
+    if dh == rh and dw == rw:
+        return u, v
+    ud = int(round(u * dw / max(rw, 1)))
+    vd = int(round(v * dh / max(rh, 1)))
+    ud = max(0, min(dw - 1, ud))
+    vd = max(0, min(dh - 1, vd))
+    return ud, vd
+
+
+def attach_depth_and_cam_xyz(
+    det: Dict[str, Any],
+    depth_image: Optional[np.ndarray],
+    rgb_shape: Tuple[int, ...],
+    intr: CameraIntrinsics,
+    cam: CameraManager,
+) -> Dict[str, Any]:
+    """为检测字典附加 depth_m 与 cam_x, cam_y, cam_z（米）。彩色与深度分辨率不同时对 (u,v) 做映射采样。"""
+    out = det.copy()
+    out["depth_m"] = 0.0
+    out["cam_x"] = 0.0
+    out["cam_y"] = 0.0
+    out["cam_z"] = 0.0
+
+    if depth_image is None:
+        return out
+
+    u, v = int(det["u"]), int(det["v"])
+    ud, vd = map_rgb_uv_to_depth_uv(u, v, rgb_shape, depth_image.shape)
+    z = cam.get_valid_depth_near_pixel(depth_image, ud, vd, kernel_size=5)
+    out["depth_m"] = float(z)
+
+    if z > 0 and np.isfinite(z):
+        cx, cy, cz = CameraManager.pixel_to_camera(u, v, z, intr)
+        out["cam_x"] = float(cx)
+        out["cam_y"] = float(cy)
+        out["cam_z"] = float(cz)
+
+    return out
 
 
 def get_detections(result) -> List[Dict[str, Any]]:
@@ -180,13 +245,17 @@ def main():
             f"原始错误: {e}"
         ) from e
 
+    use_depth = not args.no_depth
     cam = CameraManager(
         color_width=640,
         color_height=480,
         color_fps=30,
+        depth_width=640,
+        depth_height=480,
+        depth_fps=30,
         enable_color=True,
-        enable_depth=False,
-        align_to_color=False,
+        enable_depth=use_depth,
+        align_to_color=args.align_to_color,
     )
 
     prev_time = time.time()
@@ -204,13 +273,17 @@ def main():
 
         intr = cam.get_intrinsics()
         print("[INFO] intrinsics:", intr)
+        print("[INFO] depth stream:", "on" if use_depth else "off (--no-depth)")
 
         window_name = "YOLO Grasp Prep (on change)"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        if args.show_depth_panel and use_depth:
+            cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
 
         while True:
             frame_bundle = cam.get_frame(timeout_ms=1000)
             frame = frame_bundle.rgb
+            depth_img = frame_bundle.depth if use_depth else None
 
             if frame is None:
                 print("[WARN] empty rgb frame")
@@ -247,6 +320,7 @@ def main():
                 best_target = last_best
 
             vis = frame.copy()
+            rgb_shape = frame.shape
 
             if detections:
                 for det in detections:
@@ -258,6 +332,14 @@ def main():
                     safe_put_text(vis, f'({det["u"]}, {det["v"]})', (det["x1"], min(vis.shape[0] - 10, det["y2"] + 20)), 0.5, 1)
 
             if best_target is not None:
+                best_e = attach_depth_and_cam_xyz(
+                    best_target,
+                    depth_img,
+                    rgb_shape,
+                    intr,
+                    cam,
+                )
+
                 draw_box(
                     vis,
                     best_target["x1"],
@@ -277,15 +359,34 @@ def main():
                     2,
                     color=(255, 0, 0),
                 )
+                if use_depth:
+                    safe_put_text(
+                        vis,
+                        f'Z={best_e["depth_m"]:.3f}m  cam=({best_e["cam_x"]:.3f},{best_e["cam_y"]:.3f},{best_e["cam_z"]:.3f})',
+                        (20, 120),
+                        0.55,
+                        2,
+                        color=(255, 0, 0),
+                    )
 
                 if best_target_changed(published_best, best_target, args.pixel_threshold):
-                    published_best = best_target.copy()
-                    print(
-                        f'[TARGET] class={best_target["class_name"]}, '
-                        f'conf={best_target["conf"]:.3f}, '
-                        f'pixel=({best_target["u"]}, {best_target["v"]}), '
-                        f'bbox=({best_target["x1"]}, {best_target["y1"]}, {best_target["x2"]}, {best_target["y2"]})'
-                    )
+                    published_best = best_e.copy()
+                    if use_depth:
+                        print(
+                            f'[TARGET] class={best_e["class_name"]}, '
+                            f'conf={best_e["conf"]:.3f}, '
+                            f'pixel=({best_e["u"]}, {best_e["v"]}), '
+                            f'bbox=({best_e["x1"]}, {best_e["y1"]}, {best_e["x2"]}, {best_e["y2"]}), '
+                            f'depth_m={best_e["depth_m"]:.3f}, '
+                            f'cam_xyz=({best_e["cam_x"]:.4f}, {best_e["cam_y"]:.4f}, {best_e["cam_z"]:.4f})'
+                        )
+                    else:
+                        print(
+                            f'[TARGET] class={best_target["class_name"]}, '
+                            f'conf={best_target["conf"]:.3f}, '
+                            f'pixel=({best_target["u"]}, {best_target["v"]}), '
+                            f'bbox=({best_target["x1"]}, {best_target["y1"]}, {best_target["x2"]}, {best_target["y2"]})'
+                        )
             else:
                 if published_best is not None:
                     published_best = None
@@ -298,33 +399,70 @@ def main():
                 fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
 
             safe_put_text(vis, f"FPS: {fps:.2f}", (20, 30), 0.8, 2)
-            hint = f"q: quit | s: save | infer every {args.infer_every}f | px>{args.pixel_threshold} -> log"
+            depth_tag = "depth:on" if use_depth else "depth:off"
+            hint = f"q: quit | s: save | {depth_tag} | infer {args.infer_every}f | px>{args.pixel_threshold}"
             safe_put_text(vis, hint, (20, 60), 0.5, 1)
 
+            saved_y = 155 if use_depth else 130
             if saved_target is not None:
-                safe_put_text(
-                    vis,
-                    f'SAVED: {saved_target["class_name"]} @ ({saved_target["u"]}, {saved_target["v"]})',
-                    (20, 130),
-                    0.7,
-                    2,
-                    color=(0, 255, 255),
-                )
+                if use_depth and "depth_m" in saved_target:
+                    safe_put_text(
+                        vis,
+                        f'SAVED: {saved_target["class_name"]} @ ({saved_target["u"]}, {saved_target["v"]}) '
+                        f'Z={saved_target["depth_m"]:.3f}m',
+                        (20, saved_y),
+                        0.65,
+                        2,
+                        color=(0, 255, 255),
+                    )
+                else:
+                    safe_put_text(
+                        vis,
+                        f'SAVED: {saved_target["class_name"]} @ ({saved_target["u"]}, {saved_target["v"]})',
+                        (20, saved_y),
+                        0.7,
+                        2,
+                        color=(0, 255, 255),
+                    )
 
             cv2.imshow(window_name, vis)
+            if args.show_depth_panel and use_depth and depth_img is not None:
+                dvis = CameraManager.depth_to_colormap(depth_img)
+                if dvis.shape[0] != vis.shape[0]:
+                    scale = vis.shape[0] / max(dvis.shape[0], 1)
+                    nw = max(1, int(dvis.shape[1] * scale))
+                    dvis = cv2.resize(dvis, (nw, vis.shape[0]))
+                cv2.imshow("Depth", dvis)
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("q"):
                 break
             elif key == ord("s"):
                 if best_target is not None:
-                    saved_target = best_target.copy()
-                    print(
-                        f'[SAVE] selected target: '
-                        f'class={saved_target["class_name"]}, '
-                        f'pixel=({saved_target["u"]}, {saved_target["v"]}), '
-                        f'bbox=({saved_target["x1"]}, {saved_target["y1"]}, {saved_target["x2"]}, {saved_target["y2"]})'
+                    best_e = attach_depth_and_cam_xyz(
+                        best_target,
+                        depth_img,
+                        frame.shape,
+                        intr,
+                        cam,
                     )
+                    saved_target = best_e.copy()
+                    if use_depth:
+                        print(
+                            f'[SAVE] selected target: '
+                            f'class={saved_target["class_name"]}, '
+                            f'pixel=({saved_target["u"]}, {saved_target["v"]}), '
+                            f'bbox=({saved_target["x1"]}, {saved_target["y1"]}, {saved_target["x2"]}, {saved_target["y2"]}), '
+                            f'depth_m={saved_target["depth_m"]:.3f}, '
+                            f'cam_xyz=({saved_target["cam_x"]:.4f}, {saved_target["cam_y"]:.4f}, {saved_target["cam_z"]:.4f})'
+                        )
+                    else:
+                        print(
+                            f'[SAVE] selected target: '
+                            f'class={saved_target["class_name"]}, '
+                            f'pixel=({saved_target["u"]}, {saved_target["v"]}), '
+                            f'bbox=({saved_target["x1"]}, {saved_target["y1"]}, {saved_target["x2"]}, {saved_target["y2"]})'
+                        )
                 else:
                     print("[SAVE] no target to save")
 
