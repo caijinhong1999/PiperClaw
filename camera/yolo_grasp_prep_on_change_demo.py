@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import argparse
+import configparser
 from typing import Optional, Tuple, List, Dict, Any
 
 import cv2
@@ -151,6 +152,12 @@ def parse_args():
         help="bbox 模式取样时对框做收缩比例（0~0.49），避免边缘背景干扰；0.25 表示四边各收缩 25%",
     )
     parser.add_argument(
+        "--camera-param-ini",
+        type=str,
+        default="",
+        help="Orbbec Viewer 导出的 CameraParam ini 路径（包含 Color/Depth 内参与 D2CTransformParam）。提供后将自动按 ini 的分辨率启动相机并用于 cam_xyz 计算。",
+    )
+    parser.add_argument(
         "--time-stat",
         action="store_true",
         help="开启耗时统计（取帧/YOLO/画图imshow）",
@@ -186,7 +193,10 @@ def attach_depth_and_cam_xyz(
     det: Dict[str, Any],
     depth_image: Optional[np.ndarray],
     rgb_shape: Tuple[int, ...],
-    intr: CameraIntrinsics,
+    intr_color: CameraIntrinsics,
+    intr_depth: CameraIntrinsics,
+    d2c_R: Optional[np.ndarray],
+    d2c_t: Optional[np.ndarray],
     cam: CameraManager,
     min_depth_m: float = 0.05,
     max_depth_m: float = 3.0,
@@ -250,12 +260,58 @@ def attach_depth_and_cam_xyz(
     out["depth_m"] = float(z)
 
     if z > 0 and np.isfinite(z):
-        cx, cy, cz = CameraManager.pixel_to_camera(u, v, z, intr)
-        out["cam_x"] = float(cx)
-        out["cam_y"] = float(cy)
-        out["cam_z"] = float(cz)
+        # Use depth intrinsics + depth pixel to compute 3D in depth camera coordinates.
+        dx, dy, dz = CameraManager.pixel_to_camera(ud, vd, z, intr_depth)
+
+        # Transform to color camera coordinates if D2C extrinsics provided.
+        if d2c_R is not None and d2c_t is not None:
+            p = np.array([dx, dy, dz], dtype=np.float64)
+            pc = (d2c_R @ p) + d2c_t
+            out["cam_x"] = float(pc[0])
+            out["cam_y"] = float(pc[1])
+            out["cam_z"] = float(pc[2])
+        else:
+            out["cam_x"] = float(dx)
+            out["cam_y"] = float(dy)
+            out["cam_z"] = float(dz)
 
     return out
+
+
+def load_camera_param_ini(path: str) -> Tuple[CameraIntrinsics, CameraIntrinsics, np.ndarray, np.ndarray]:
+    """
+    Parse Orbbec Viewer exported CameraParam ini.
+    Returns: (color_intr, depth_intr, R(3,3), t(3,))
+    """
+    cp = configparser.ConfigParser()
+    with open(path, "r", encoding="utf-8") as f:
+        cp.read_file(f)
+
+    def _intr(section: str) -> CameraIntrinsics:
+        s = cp[section]
+        return CameraIntrinsics(
+            width=int(float(s.get("width"))),
+            height=int(float(s.get("height"))),
+            fx=float(s.get("fx")),
+            fy=float(s.get("fy")),
+            cx=float(s.get("cx")),
+            cy=float(s.get("cy")),
+        )
+
+    color_intr = _intr("ColorIntrinsic")
+    depth_intr = _intr("DepthIntrinsic")
+
+    s = cp["D2CTransformParam"]
+    R = np.array(
+        [
+            [float(s.get("rot0")), float(s.get("rot1")), float(s.get("rot2"))],
+            [float(s.get("rot3")), float(s.get("rot4")), float(s.get("rot5"))],
+            [float(s.get("rot6")), float(s.get("rot7")), float(s.get("rot8"))],
+        ],
+        dtype=np.float64,
+    )
+    t = np.array([float(s.get("trans0")), float(s.get("trans1")), float(s.get("trans2"))], dtype=np.float64)
+    return color_intr, depth_intr, R, t
 
 
 def get_detections(result) -> List[Dict[str, Any]]:
@@ -343,6 +399,19 @@ def main():
     if args.classes.strip():
         target_class_names = {x.strip() for x in args.classes.split(",") if x.strip()}
 
+    ini_color_intr: Optional[CameraIntrinsics] = None
+    ini_depth_intr: Optional[CameraIntrinsics] = None
+    d2c_R: Optional[np.ndarray] = None
+    d2c_t: Optional[np.ndarray] = None
+    if args.camera_param_ini.strip():
+        ini_path = args.camera_param_ini.strip()
+        if not os.path.isabs(ini_path):
+            ini_path = os.path.join(PROJECT_ROOT, ini_path)
+        ini_color_intr, ini_depth_intr, d2c_R, d2c_t = load_camera_param_ini(ini_path)
+        print("[INFO] loaded camera param ini:", ini_path)
+        print("[INFO] ini color intr:", ini_color_intr)
+        print("[INFO] ini depth intr:", ini_depth_intr)
+
     print(f"[INFO] loading model: {args.model}")
     try:
         model = YOLO(args.model)
@@ -354,12 +423,17 @@ def main():
         ) from e
 
     use_depth = not args.no_depth
+    # If ini provided, use its resolution to match camera param/profile.
+    cw = int(ini_color_intr.width) if ini_color_intr is not None else 640
+    ch = int(ini_color_intr.height) if ini_color_intr is not None else 480
+    dw = int(ini_depth_intr.width) if ini_depth_intr is not None else 640
+    dh = int(ini_depth_intr.height) if ini_depth_intr is not None else 480
     cam = CameraManager(
-        color_width=640,
-        color_height=480,
+        color_width=cw,
+        color_height=ch,
         color_fps=30,
-        depth_width=640,
-        depth_height=480,
+        depth_width=dw,
+        depth_height=dh,
         depth_fps=30,
         enable_color=True,
         enable_depth=use_depth,
@@ -381,8 +455,13 @@ def main():
         print("[INFO] camera started")
         print("[INFO] frame grab: latest-only (后台线程持续取流，减轻 Pipeline 队列满/丢帧)")
 
-        intr = cam.get_intrinsics()
-        print("[INFO] intrinsics:", intr)
+        # Prefer ini intrinsics if provided; else use SDK intrinsics (color) as legacy default.
+        intr_color = ini_color_intr if ini_color_intr is not None else cam.get_intrinsics()
+        intr_depth = ini_depth_intr if ini_depth_intr is not None else (
+            cam.get_depth_intrinsics() if hasattr(cam, "get_depth_intrinsics") else intr_color
+        )
+        print("[INFO] intrinsics(color):", intr_color)
+        print("[INFO] intrinsics(depth):", intr_depth)
         print("[INFO] depth stream:", "on" if use_depth else "off (--no-depth)")
 
         window_name = "YOLO Grasp Prep (on change)"
@@ -474,7 +553,10 @@ def main():
                     best_target,
                     depth_img,
                     rgb_shape,
-                    intr,
+                    intr_color,
+                    intr_depth,
+                    d2c_R,
+                    d2c_t,
                     cam,
                     min_depth_m=args.min_depth_m,
                     max_depth_m=args.max_depth_m,
@@ -605,7 +687,10 @@ def main():
                         best_target,
                         depth_img,
                         frame.shape,
-                        intr,
+                        intr_color,
+                        intr_depth,
+                        d2c_R,
+                        d2c_t,
                         cam,
                         min_depth_m=args.min_depth_m,
                         max_depth_m=args.max_depth_m,

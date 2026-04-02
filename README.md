@@ -72,7 +72,7 @@ python camera/yolo_grasp_prep_demo.py --model ~/PiperClaw/models/yolov8n.pt
 
 在 `yolo_grasp_prep_demo.py` 基础上：**仅当最佳目标相对上一次输出发生有意义变化时**才打印 `[TARGET]`；在 grasp_prep 的字段上增加 **`depth_m`（米）** 与 **`cam_xyz`**（相机坐标系，米）。默认 **开启 RGB + 深度流**；类别变化、检测从无到有/从有到无、或中心 `(u,v)` 移动超过阈值视为变化。失去最佳目标时会打印 `[INFO] best target cleared (no detection)`。可选 **`--infer-every N`** 每 N 帧做一次 YOLO，以降低 GPU 占用（未推理帧沿用上次框叠画，快速运动时可能略有偏差）。
 
-深度与彩色分辨率不一致时会按比例映射采样；几何对齐依赖设备，未做 SDK D2C 时三维可能有偏差。建议 USB3；若开流失败可试 **`--no-depth`** 仅跑 RGB。
+深度与彩色分辨率不一致时会按比例映射采样；几何对齐依赖设备。建议 USB3；若开流失败可试 **`--no-depth`** 仅跑 RGB。
 
 本脚本使用 `CameraManager(..., latest_only=True)`：后台线程持续从 SDK 取流并只保留**最新一帧**，主线程每次 `get_frame` 取快照，用于缓解 **`Pipeline ... queue fulled, drop the oldest frame`**（处理慢于采集时）。
 
@@ -83,7 +83,20 @@ python camera/yolo_grasp_prep_demo.py --model ~/PiperClaw/models/yolov8n.pt
 ```bash
 conda activate piperclaw
 cd ~/PiperClaw
-python camera/yolo_grasp_prep_on_change_demo.py --model ~/PiperClaw/models/yolov8n.pt
+python camera/yolo_grasp_prep_on_change_demo.py \
+  --model ~/PiperClaw/models/yolov8n.pt \
+  --classes remote,cup,bottle \
+  --min-depth-m 0.1 --max-depth-m 2.0 \
+  --depth-mode bbox --depth-bbox-shrink 0.25
+
+```
+
+如果你要启用 **D2C 对齐**（用于更准确地把深度对齐到彩色坐标，便于输出稳定 `cam_xyz`），可加：`--align-to-color`。
+
+如果要临时打印 SDK 相关接口探测信息（一次性），可设置环境变量再运行：
+
+```bash
+OB_SDK_DEBUG=1 python camera/yolo_grasp_prep_on_change_demo.py --model ~/PiperClaw/models/yolov8n.pt
 ```
 
 ### 常用参数
@@ -98,7 +111,17 @@ python camera/yolo_grasp_prep_on_change_demo.py --model ~/PiperClaw/models/yolov
 | `--pixel-threshold` | 中心点移动超过该像素才再次输出 `[TARGET]` | `10` |
 | `--infer-every` | 每 N 帧运行一次 YOLO（≥1）；大于 1 可降低推理频率 | `1` |
 | `--no-depth` | 仅 RGB，关闭深度流（`[TARGET]` / `[SAVE]` 不含深度字段） | 默认不加：深度开 |
-| `--align-to-color` | 尝试启用帧同步（设备不支持会忽略） | 否 |
+| `--align-to-color` | 尝试启用 D2C 对齐 + 帧同步（设备不支持会忽略） | 否 |
 | `--show-depth-panel` | 额外打开「Depth」窗口显示深度伪彩色 | 否 |
+| `--display-every` | 每 N 帧刷新一次窗口显示（≥1），降低 `imshow/waitKey` 卡顿 | `1` |
+| `--waitkey-ms` | `cv2.waitKey` 等待毫秒数（用于处理窗口事件） | `1` |
+| `--display-scale` | 仅用于显示的缩放比例（0.1~1.0），不影响推理 | `1.0` |
+| `--min-depth-m` | 深度有效下限（米），小于该值视为无效 | `0.05` |
+| `--max-depth-m` | 深度有效上限（米），大于该值视为无效 | `3.0` |
+| `--depth-mode` | 深度取样方式：`center` / `bbox` | `bbox` |
+| `--depth-kernel` | `center` 模式邻域核大小（奇数） | `7` |
+| `--depth-bbox-shrink` | `bbox` 模式对框的收缩比例（0~0.49） | `0.25` |
+| `--time-stat` | 打印耗时统计（含 `imshow` 分项） | 否 |
+| `--time-print-every` | 每 N 帧打印一次耗时统计 | `30` |
 
 交互：**q** 退出，**s** 保存当前最佳目标。开启深度时 `[SAVE]` 含 `depth_m` 与 `cam_xyz`；`--no-depth` 时与 `yolo_grasp_prep_demo.py` 的像素/bbox 行格式一致。
