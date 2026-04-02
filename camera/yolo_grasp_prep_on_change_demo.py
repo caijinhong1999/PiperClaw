@@ -114,6 +114,12 @@ def parse_args():
         help="每 N 帧刷新一次窗口显示（>=1），降低 imshow/waitKey 开销",
     )
     parser.add_argument(
+        "--waitkey-ms",
+        type=int,
+        default=1,
+        help="cv2.waitKey 等待毫秒数（用于处理窗口事件；默认 1）",
+    )
+    parser.add_argument(
         "--time-stat",
         action="store_true",
         help="开启耗时统计（取帧/YOLO/画图imshow）",
@@ -254,6 +260,8 @@ def main():
         raise SystemExit("--infer-every 必须 >= 1")
     if args.display_every < 1:
         raise SystemExit("--display-every 必须 >= 1")
+    if args.waitkey_ms < 0:
+        raise SystemExit("--waitkey-ms 必须 >= 0")
 
     target_class_names = set()
     if args.classes.strip():
@@ -493,16 +501,18 @@ def main():
 
             key = 255
             t_imshow0 = time.perf_counter()
-            if (not args.no_gui) and (frame_index % args.display_every == 0):
-                cv2.imshow(window_name, vis)
-                if args.show_depth_panel and use_depth and depth_img is not None:
-                    dvis = CameraManager.depth_to_colormap(depth_img)
-                    if dvis.shape[0] != vis.shape[0]:
-                        scale = vis.shape[0] / max(dvis.shape[0], 1)
-                        nw = max(1, int(dvis.shape[1] * scale))
-                        dvis = cv2.resize(dvis, (nw, vis.shape[0]))
-                    cv2.imshow("Depth", dvis)
-                key = cv2.waitKey(1) & 0xFF
+            if not args.no_gui:
+                # 关键点：即使不刷新画面，也要每帧处理一次 GUI 事件，避免事件队列堆积导致后续 waitKey 阻塞很久
+                if frame_index % args.display_every == 0:
+                    cv2.imshow(window_name, vis)
+                    if args.show_depth_panel and use_depth and depth_img is not None:
+                        dvis = CameraManager.depth_to_colormap(depth_img)
+                        if dvis.shape[0] != vis.shape[0]:
+                            scale = vis.shape[0] / max(dvis.shape[0], 1)
+                            nw = max(1, int(dvis.shape[1] * scale))
+                            dvis = cv2.resize(dvis, (nw, vis.shape[0]))
+                        cv2.imshow("Depth", dvis)
+                key = cv2.waitKey(int(args.waitkey_ms)) & 0xFF
             t_vis1 = time.perf_counter()
             t_imshow1 = t_vis1
 
