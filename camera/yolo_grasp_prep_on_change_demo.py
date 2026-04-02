@@ -132,6 +132,25 @@ def parse_args():
         help="深度有效上限（米），大于该值视为无效",
     )
     parser.add_argument(
+        "--depth-mode",
+        type=str,
+        default="bbox",
+        choices=["center", "bbox"],
+        help="深度取样方式：center=中心邻域中值；bbox=bbox区域内有效深度中值（更稳，默认）",
+    )
+    parser.add_argument(
+        "--depth-kernel",
+        type=int,
+        default=7,
+        help="center 模式的邻域核大小（奇数），越大越稳但越可能混入背景",
+    )
+    parser.add_argument(
+        "--depth-bbox-shrink",
+        type=float,
+        default=0.25,
+        help="bbox 模式取样时对框做收缩比例（0~0.49），避免边缘背景干扰；0.25 表示四边各收缩 25%",
+    )
+    parser.add_argument(
         "--time-stat",
         action="store_true",
         help="开启耗时统计（取帧/YOLO/画图imshow）",
@@ -171,6 +190,9 @@ def attach_depth_and_cam_xyz(
     cam: CameraManager,
     min_depth_m: float = 0.05,
     max_depth_m: float = 3.0,
+    depth_mode: str = "bbox",
+    depth_kernel: int = 7,
+    depth_bbox_shrink: float = 0.25,
 ) -> Dict[str, Any]:
     """为检测字典附加 depth_m 与 cam_x, cam_y, cam_z（米）。彩色与深度分辨率不同时对 (u,v) 做映射采样。"""
     out = det.copy()
@@ -184,7 +206,44 @@ def attach_depth_and_cam_xyz(
 
     u, v = int(det["u"]), int(det["v"])
     ud, vd = map_rgb_uv_to_depth_uv(u, v, rgb_shape, depth_image.shape)
-    z = cam.get_valid_depth_near_pixel(depth_image, ud, vd, kernel_size=5)
+
+    # 更鲁棒的深度取样：优先 bbox 区域有效深度中位数
+    z = 0.0
+    if depth_mode == "bbox":
+        dh, dw = depth_image.shape[:2]
+        x1, y1, x2, y2 = int(det["x1"]), int(det["y1"]), int(det["x2"]), int(det["y2"])
+        x1d, y1d = map_rgb_uv_to_depth_uv(x1, y1, rgb_shape, depth_image.shape)
+        x2d, y2d = map_rgb_uv_to_depth_uv(x2, y2, rgb_shape, depth_image.shape)
+        xa, xb = (x1d, x2d) if x1d <= x2d else (x2d, x1d)
+        ya, yb = (y1d, y2d) if y1d <= y2d else (y2d, y1d)
+
+        xa = max(0, min(dw - 1, xa))
+        xb = max(0, min(dw - 1, xb))
+        ya = max(0, min(dh - 1, ya))
+        yb = max(0, min(dh - 1, yb))
+
+        # shrink bbox to reduce background
+        shrink = float(depth_bbox_shrink)
+        shrink = max(0.0, min(0.49, shrink))
+        w = max(0, xb - xa)
+        h = max(0, yb - ya)
+        xa2 = int(round(xa + w * shrink))
+        xb2 = int(round(xb - w * shrink))
+        ya2 = int(round(ya + h * shrink))
+        yb2 = int(round(yb - h * shrink))
+        if xb2 > xa2 and yb2 > ya2:
+            patch = depth_image[ya2:yb2, xa2:xb2]
+            valid = patch[(patch > min_depth_m) & (patch < max_depth_m) & np.isfinite(patch)]
+            if valid.size > 0:
+                z = float(np.median(valid))
+
+    if z <= 0.0:
+        k = int(depth_kernel)
+        if k < 1:
+            k = 1
+        if k % 2 == 0:
+            k += 1
+        z = float(cam.get_valid_depth_near_pixel(depth_image, ud, vd, kernel_size=k))
     z = float(z)
     if (not np.isfinite(z)) or (z < min_depth_m) or (z > max_depth_m):
         z = 0.0
@@ -419,6 +478,9 @@ def main():
                     cam,
                     min_depth_m=args.min_depth_m,
                     max_depth_m=args.max_depth_m,
+                    depth_mode=args.depth_mode,
+                    depth_kernel=args.depth_kernel,
+                    depth_bbox_shrink=args.depth_bbox_shrink,
                 )
                 t_attach1 = time.perf_counter()
 
@@ -547,6 +609,9 @@ def main():
                         cam,
                         min_depth_m=args.min_depth_m,
                         max_depth_m=args.max_depth_m,
+                        depth_mode=args.depth_mode,
+                        depth_kernel=args.depth_kernel,
+                        depth_bbox_shrink=args.depth_bbox_shrink,
                     )
                     saved_target = best_e.copy()
                     if use_depth:
