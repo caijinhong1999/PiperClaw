@@ -242,7 +242,9 @@ class CameraManager:
             while time.time() < deadline:
                 with self._latest_lock:
                     if self._latest_bundle is not None:
-                        return self._copy_frame_bundle(self._latest_bundle)
+                        # latest_only 下避免对整帧做 numpy copy
+                        # 调用方会对 rgb 做 frame.copy() 用于绘制，因此返回共享快照引用即可降低延迟
+                        return self._latest_bundle
                 time.sleep(0.001)
             raise CameraError("获取帧超时：尚无可用帧")
 
