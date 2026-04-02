@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 import time
 import threading
+import os
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -116,6 +117,11 @@ class CameraManager:
         self._grab_thread: Optional[threading.Thread] = None
 
         self._cached_intrinsics: Optional[CameraIntrinsics] = None
+        self._cached_color_intrinsics: Optional[CameraIntrinsics] = None
+        self._cached_depth_intrinsics: Optional[CameraIntrinsics] = None
+        self._warned_intrinsics_fallback = False
+        self._debug_sdk = os.environ.get("OB_SDK_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+        self._debug_sdk_done = False
         self._depth_scale: Optional[float] = None
         self._active_color_profile = None
         self._active_depth_profile = None
@@ -173,6 +179,15 @@ class CameraManager:
                 self._pipeline.start(self._config)
                 self._started = True
 
+                if self._debug_sdk and not self._debug_sdk_done:
+                    try:
+                        self._debug_sdk_introspection(stage="after_start", obj=self._pipeline)
+                        self._debug_sdk_introspection(stage="after_start", obj=self._config)
+                        if self._ctx is not None:
+                            self._debug_sdk_introspection(stage="after_start", obj=self._ctx)
+                    except Exception:
+                        pass
+
                 if self._latest_only:
                     self._grab_stop.clear()
                     self._latest_bundle = None
@@ -221,6 +236,9 @@ class CameraManager:
                 self._config = None
                 self._ctx = None
                 self._cached_intrinsics = None
+                self._cached_color_intrinsics = None
+                self._cached_depth_intrinsics = None
+                self._warned_intrinsics_fallback = False
                 self._depth_scale = None
                 self._active_color_profile = None
                 self._active_depth_profile = None
@@ -267,6 +285,25 @@ class CameraManager:
                 frames = self._pipeline.wait_for_frames(200)
                 if frames is None:
                     continue
+                if self._debug_sdk and not self._debug_sdk_done:
+                    try:
+                        self._debug_sdk_introspection(stage="first_frameset", obj=frames)
+                        # also introspect frames inside frameset
+                        try:
+                            cf = frames.get_color_frame()
+                            if cf is not None:
+                                self._debug_sdk_introspection(stage="first_frameset", obj=cf)
+                        except Exception:
+                            pass
+                        try:
+                            df = frames.get_depth_frame()
+                            if df is not None:
+                                self._debug_sdk_introspection(stage="first_frameset", obj=df)
+                        except Exception:
+                            pass
+                        self._debug_sdk_done = True
+                    except Exception:
+                        pass
                 bundle = self._process_frameset(frames)
                 with self._latest_lock:
                     self._latest_bundle = bundle
@@ -291,6 +328,12 @@ class CameraManager:
         depth_image = None
         rgb_ts = None
         depth_ts = None
+
+        # best-effort: try cache intrinsics from current frameset
+        try:
+            self._try_cache_intrinsics_from_frameset(frames)
+        except Exception:
+            pass
 
         if self.enable_color:
             try:
@@ -328,13 +371,39 @@ class CameraManager:
         2. 再尝试从当前 frame 的 stream profile 获取
         3. 最后返回一个近似内参，保证流程先跑通
         """
-        if self._cached_intrinsics is not None:
-            return self._cached_intrinsics
+        # backward-compatible: prefer color if enabled, else depth
+        if self.enable_color:
+            return self.get_color_intrinsics()
+        if self.enable_depth:
+            return self.get_depth_intrinsics()
+        raise CameraError("未启用 color/depth，无法获取内参")
 
+    def get_color_intrinsics(self) -> CameraIntrinsics:
+        if self._cached_color_intrinsics is not None:
+            return self._cached_color_intrinsics
+        intr = self._get_intrinsics_for_profile(self._active_color_profile, prefer_sensor="color")
+        self._cached_color_intrinsics = intr
+        # also fill legacy cache for compatibility
+        self._cached_intrinsics = intr
+        return intr
+
+    def get_depth_intrinsics(self) -> CameraIntrinsics:
+        if self._cached_depth_intrinsics is not None:
+            return self._cached_depth_intrinsics
+        intr = self._get_intrinsics_for_profile(self._active_depth_profile, prefer_sensor="depth")
+        self._cached_depth_intrinsics = intr
+        return intr
+
+    def _get_intrinsics_for_profile(self, profile: Any, prefer_sensor: str) -> CameraIntrinsics:
         if not self._started:
             raise CameraError("相机尚未启动，无法获取内参")
 
-        profile = self._active_color_profile if self.enable_color else self._active_depth_profile
+        # 0) if already cached from frameset
+        if prefer_sensor == "color" and self._cached_color_intrinsics is not None:
+            return self._cached_color_intrinsics
+        if prefer_sensor == "depth" and self._cached_depth_intrinsics is not None:
+            return self._cached_depth_intrinsics
+
         if profile is None:
             raise CameraError("当前没有活动的 stream profile，无法获取内参")
 
@@ -349,7 +418,11 @@ class CameraManager:
                 cx=float(intrinsic.cx),
                 cy=float(intrinsic.cy),
             )
-            self._cached_intrinsics = intr
+            if prefer_sensor == "color":
+                self._cached_color_intrinsics = intr
+                self._cached_intrinsics = intr
+            else:
+                self._cached_depth_intrinsics = intr
             return intr
         except Exception:
             pass
@@ -360,9 +433,9 @@ class CameraManager:
                 frames = self._pipeline.wait_for_frames(1000)
                 if frames is not None:
                     frame = None
-                    if self.enable_color:
+                    if prefer_sensor == "color":
                         frame = frames.get_color_frame()
-                    elif self.enable_depth:
+                    elif prefer_sensor == "depth":
                         frame = frames.get_depth_frame()
 
                     if frame is not None:
@@ -377,7 +450,11 @@ class CameraManager:
                                 cx=float(intrinsic.cx),
                                 cy=float(intrinsic.cy),
                             )
-                            self._cached_intrinsics = intr
+                            if prefer_sensor == "color":
+                                self._cached_color_intrinsics = intr
+                                self._cached_intrinsics = intr
+                            else:
+                                self._cached_depth_intrinsics = intr
                             return intr
                         except Exception:
                             pass
@@ -389,8 +466,8 @@ class CameraManager:
             width = int(profile.get_width())
             height = int(profile.get_height())
         except Exception:
-            width = int(self.color_width if self.enable_color else self.depth_width)
-            height = int(self.color_height if self.enable_color else self.depth_height)
+            width = int(self.color_width if prefer_sensor == "color" else self.depth_width)
+            height = int(self.color_height if prefer_sensor == "color" else self.depth_height)
 
         # 这里是为了保证后续流程不崩，不是真实标定值
         fx = width * 0.9
@@ -406,9 +483,138 @@ class CameraManager:
             cx=float(cx),
             cy=float(cy),
         )
-        self._cached_intrinsics = intr
-        _safe_print("[WARN] SDK 未返回真实内参，当前使用近似内参兜底：", intr)
+        if prefer_sensor == "color":
+            self._cached_color_intrinsics = intr
+            self._cached_intrinsics = intr
+        else:
+            self._cached_depth_intrinsics = intr
+
+        if not self._warned_intrinsics_fallback:
+            self._warned_intrinsics_fallback = True
+            _safe_print("[WARN] SDK 未返回真实内参，当前使用近似内参兜底：", intr)
         return intr
+
+    def _try_cache_intrinsics_from_frameset(self, frames: Any) -> None:
+        """
+        best-effort: cache intrinsics from current frameset without extra wait_for_frames.
+        Tries stream_profile.get_intrinsic() and (if available) frames.get_camera_param().
+        """
+        # stream_profile path
+        try:
+            if self.enable_color and self._cached_color_intrinsics is None:
+                cf = frames.get_color_frame()
+                if cf is not None:
+                    sp = cf.get_stream_profile()
+                    intrinsic = sp.get_intrinsic()
+                    self._cached_color_intrinsics = CameraIntrinsics(
+                        width=int(intrinsic.width),
+                        height=int(intrinsic.height),
+                        fx=float(intrinsic.fx),
+                        fy=float(intrinsic.fy),
+                        cx=float(intrinsic.cx),
+                        cy=float(intrinsic.cy),
+                    )
+                    self._cached_intrinsics = self._cached_color_intrinsics
+        except Exception:
+            pass
+
+        try:
+            if self.enable_depth and self._cached_depth_intrinsics is None:
+                df = frames.get_depth_frame()
+                if df is not None:
+                    sp = df.get_stream_profile()
+                    intrinsic = sp.get_intrinsic()
+                    self._cached_depth_intrinsics = CameraIntrinsics(
+                        width=int(intrinsic.width),
+                        height=int(intrinsic.height),
+                        fx=float(intrinsic.fx),
+                        fy=float(intrinsic.fy),
+                        cx=float(intrinsic.cx),
+                        cy=float(intrinsic.cy),
+                    )
+        except Exception:
+            pass
+
+        # camera_param path (SDK-dependent)
+        cam_param = None
+        for name in ("get_camera_param", "get_camera_params", "get_camera_parameter"):
+            try:
+                fn = getattr(frames, name, None)
+                if callable(fn):
+                    cam_param = fn()
+                    break
+            except Exception:
+                pass
+
+        if cam_param is not None:
+            # try common field patterns
+            self._try_cache_from_camera_param_object(cam_param)
+
+    def _try_cache_from_camera_param_object(self, cam_param: Any) -> None:
+        """
+        Handle various pyorbbecsdk camera param object shapes.
+        """
+        # common: cam_param.rgbIntrinsic / colorIntrinsic / depthIntrinsic
+        candidates = [
+            ("color", "rgbIntrinsic"),
+            ("color", "colorIntrinsic"),
+            ("color", "rgb_intrinsic"),
+            ("color", "color_intrinsic"),
+            ("depth", "depthIntrinsic"),
+            ("depth", "depth_intrinsic"),
+        ]
+        for sensor, attr in candidates:
+            if sensor == "color" and self._cached_color_intrinsics is not None:
+                continue
+            if sensor == "depth" and self._cached_depth_intrinsics is not None:
+                continue
+            try:
+                obj = getattr(cam_param, attr)
+            except Exception:
+                continue
+            try:
+                intr = CameraIntrinsics(
+                    width=int(getattr(obj, "width", 0) or (self.color_width if sensor == "color" else self.depth_width)),
+                    height=int(getattr(obj, "height", 0) or (self.color_height if sensor == "color" else self.depth_height)),
+                    fx=float(getattr(obj, "fx")),
+                    fy=float(getattr(obj, "fy")),
+                    cx=float(getattr(obj, "cx")),
+                    cy=float(getattr(obj, "cy")),
+                )
+            except Exception:
+                continue
+            if sensor == "color":
+                self._cached_color_intrinsics = intr
+                self._cached_intrinsics = intr
+            else:
+                self._cached_depth_intrinsics = intr
+
+    def _debug_sdk_introspection(self, stage: str, obj: Any) -> None:
+        """
+        Print SDK object methods that may relate to calibration/params/intrinsics.
+        Enable by setting environment variable OB_SDK_DEBUG=1.
+        """
+        try:
+            name = type(obj).__name__
+        except Exception:
+            name = str(type(obj))
+        try:
+            attrs = dir(obj)
+        except Exception:
+            attrs = []
+
+        keywords = ("param", "calib", "intrin", "intrinsic", "camera", "calibration", "d2c", "align", "extrin", "extrinsic")
+        hits = []
+        for a in attrs:
+            al = a.lower()
+            if any(k in al for k in keywords):
+                hits.append(a)
+        hits = sorted(set(hits))
+
+        _safe_print(f"[OB_SDK_DEBUG] stage={stage} obj={name} hits({len(hits)}):")
+        if hits:
+            # keep output readable
+            _safe_print("  " + ", ".join(hits[:200]) + ("" if len(hits) <= 200 else " ..."))
 
     def get_depth_scale(self) -> float:
         if self._depth_scale is not None:
