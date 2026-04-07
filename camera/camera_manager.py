@@ -35,13 +35,9 @@ try:
         OBFormat,
         OBAlignMode,
     )
-except Exception:
-    Context = None
-    Pipeline = None
-    Config = None
-    OBSensorType = None
-    OBFormat = None
-    OBAlignMode = None
+except Exception as e:
+    print("pyorbbecsdk import failed:", repr(e))
+    raise
 
 
 def _safe_print(*args, **kwargs) -> None:
