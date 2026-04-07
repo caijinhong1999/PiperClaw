@@ -19,6 +19,7 @@ import sys
 import time
 import argparse
 import configparser
+import json
 from typing import Optional, Tuple, List, Dict, Any
 
 import cv2
@@ -158,6 +159,12 @@ def parse_args():
         help="Orbbec Viewer 导出的 CameraParam ini 路径（包含 Color/Depth 内参与 D2CTransformParam）。提供后将自动按 ini 的分辨率启动相机并用于 cam_xyz 计算。",
     )
     parser.add_argument(
+        "--cam-to-base-json",
+        type=str,
+        default="",
+        help="手眼标定结果文件（JSON）：相机坐标到机械臂基坐标的刚体变换。格式示例：{'rotation':[[...],[...],[...]], 'translation':[tx,ty,tz]}（单位: 米）。",
+    )
+    parser.add_argument(
         "--time-stat",
         action="store_true",
         help="开启耗时统计（取帧/YOLO/画图imshow）",
@@ -275,6 +282,58 @@ def attach_depth_and_cam_xyz(
             out["cam_y"] = float(dy)
             out["cam_z"] = float(dz)
 
+    return out
+
+
+def load_rigid_transform_json(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load rigid transform from JSON.
+    Expected keys:
+      - rotation: 3x3 nested list
+      - translation: [tx, ty, tz]
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if "rotation" not in data or "translation" not in data:
+        raise ValueError("transform json 必须包含 rotation 和 translation 字段")
+
+    R = np.array(data["rotation"], dtype=np.float64)
+    t = np.array(data["translation"], dtype=np.float64).reshape(3)
+    if R.shape != (3, 3):
+        raise ValueError("rotation 必须是 3x3")
+    return R, t
+
+
+def attach_robot_xyz(
+    det: Dict[str, Any],
+    cam_to_base_R: Optional[np.ndarray],
+    cam_to_base_t: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    """
+    在 det 中补充 robot_x/robot_y/robot_z（机械臂基坐标系，米）。
+    """
+    out = det.copy()
+    out["robot_x"] = 0.0
+    out["robot_y"] = 0.0
+    out["robot_z"] = 0.0
+
+    if cam_to_base_R is None or cam_to_base_t is None:
+        return out
+
+    x = float(out.get("cam_x", 0.0))
+    y = float(out.get("cam_y", 0.0))
+    z = float(out.get("cam_z", 0.0))
+    if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z)):
+        return out
+    if z <= 0.0:
+        return out
+
+    p_cam = np.array([x, y, z], dtype=np.float64)
+    p_base = (cam_to_base_R @ p_cam) + cam_to_base_t
+    out["robot_x"] = float(p_base[0])
+    out["robot_y"] = float(p_base[1])
+    out["robot_z"] = float(p_base[2])
     return out
 
 
@@ -403,6 +462,8 @@ def main():
     ini_depth_intr: Optional[CameraIntrinsics] = None
     d2c_R: Optional[np.ndarray] = None
     d2c_t: Optional[np.ndarray] = None
+    cam_to_base_R: Optional[np.ndarray] = None
+    cam_to_base_t: Optional[np.ndarray] = None
     if args.camera_param_ini.strip():
         ini_path = args.camera_param_ini.strip()
         if not os.path.isabs(ini_path):
@@ -411,6 +472,15 @@ def main():
         print("[INFO] loaded camera param ini:", ini_path)
         print("[INFO] ini color intr:", ini_color_intr)
         print("[INFO] ini depth intr:", ini_depth_intr)
+
+    if args.cam_to_base_json.strip():
+        tf_path = args.cam_to_base_json.strip()
+        if not os.path.isabs(tf_path):
+            tf_path = os.path.join(PROJECT_ROOT, tf_path)
+        cam_to_base_R, cam_to_base_t = load_rigid_transform_json(tf_path)
+        print("[INFO] loaded hand-eye transform:", tf_path)
+        print("[INFO] cam->base R:\n", cam_to_base_R)
+        print("[INFO] cam->base t:", cam_to_base_t)
 
     print(f"[INFO] loading model: {args.model}")
     try:
@@ -564,6 +634,7 @@ def main():
                     depth_kernel=args.depth_kernel,
                     depth_bbox_shrink=args.depth_bbox_shrink,
                 )
+                best_e = attach_robot_xyz(best_e, cam_to_base_R, cam_to_base_t)
                 t_attach1 = time.perf_counter()
 
                 t_draw_best0 = time.perf_counter()
@@ -595,6 +666,15 @@ def main():
                         2,
                         color=(255, 0, 0),
                     )
+                    if cam_to_base_R is not None and cam_to_base_t is not None:
+                        safe_put_text(
+                            vis,
+                            f'base=({best_e["robot_x"]:.3f},{best_e["robot_y"]:.3f},{best_e["robot_z"]:.3f})',
+                            (20, 145),
+                            0.55,
+                            2,
+                            color=(255, 0, 0),
+                        )
                 t_draw_best1 = time.perf_counter()
 
                 if best_target_changed(published_best, best_target, args.pixel_threshold):
@@ -608,6 +688,11 @@ def main():
                             f'bbox=({best_e["x1"]}, {best_e["y1"]}, {best_e["x2"]}, {best_e["y2"]}), '
                             f'depth_m={best_e["depth_m"]:.3f}, '
                             f'cam_xyz=({best_e["cam_x"]:.4f}, {best_e["cam_y"]:.4f}, {best_e["cam_z"]:.4f})'
+                            + (
+                                f', base_xyz=({best_e["robot_x"]:.4f}, {best_e["robot_y"]:.4f}, {best_e["robot_z"]:.4f})'
+                                if (cam_to_base_R is not None and cam_to_base_t is not None)
+                                else ""
+                            )
                         )
                         t_print_dur = time.perf_counter() - t_print0
                         t_print_calls = 1
@@ -698,6 +783,7 @@ def main():
                         depth_kernel=args.depth_kernel,
                         depth_bbox_shrink=args.depth_bbox_shrink,
                     )
+                    best_e = attach_robot_xyz(best_e, cam_to_base_R, cam_to_base_t)
                     saved_target = best_e.copy()
                     if use_depth:
                         print(
@@ -707,6 +793,11 @@ def main():
                             f'bbox=({saved_target["x1"]}, {saved_target["y1"]}, {saved_target["x2"]}, {saved_target["y2"]}), '
                             f'depth_m={saved_target["depth_m"]:.3f}, '
                             f'cam_xyz=({saved_target["cam_x"]:.4f}, {saved_target["cam_y"]:.4f}, {saved_target["cam_z"]:.4f})'
+                            + (
+                                f', base_xyz=({saved_target["robot_x"]:.4f}, {saved_target["robot_y"]:.4f}, {saved_target["robot_z"]:.4f})'
+                                if (cam_to_base_R is not None and cam_to_base_t is not None)
+                                else ""
+                            )
                         )
                     else:
                         print(
