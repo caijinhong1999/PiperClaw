@@ -162,7 +162,7 @@ def parse_args():
         "--cam-to-base-json",
         type=str,
         default="",
-        help="手眼标定结果文件（JSON）：相机坐标到机械臂基坐标的刚体变换。格式示例：{'rotation':[[...],[...],[...]], 'translation':[tx,ty,tz]}（单位: 米）。",
+        help="手眼标定结果文件（JSON）：相机坐标到机械臂基坐标的刚体变换。支持两种格式：1) {'rotation':[[...],[...],[...]], 'translation':[tx,ty,tz]}；2) handeye_calibration_ros 输出 {'position':[tx,ty,tz], 'orientation':[qx,qy,qz,qw]}（单位: 米）。",
     )
     parser.add_argument(
         "--time-stat",
@@ -288,21 +288,53 @@ def attach_depth_and_cam_xyz(
 def load_rigid_transform_json(path: str) -> Tuple[np.ndarray, np.ndarray]:
     """
     Load rigid transform from JSON.
-    Expected keys:
-      - rotation: 3x3 nested list
-      - translation: [tx, ty, tz]
+    Supported formats:
+      1) rotation/translation:
+         - rotation: 3x3 nested list
+         - translation: [tx, ty, tz]
+      2) handeye_calibration_ros result:
+         - position: [tx, ty, tz]
+         - orientation: [qx, qy, qz, qw]
     """
+
+    def _quat_xyzw_to_rotmat(q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=np.float64).reshape(4)
+        x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        n = x * x + y * y + z * z + w * w
+        if n <= 1e-12:
+            raise ValueError("orientation 四元数范数为 0，无法转换旋转矩阵")
+        s = 2.0 / n
+        xx, yy, zz = x * x * s, y * y * s, z * z * s
+        xy, xz, yz = x * y * s, x * z * s, y * z * s
+        wx, wy, wz = w * x * s, w * y * s, w * z * s
+        return np.array(
+            [
+                [1.0 - (yy + zz), xy - wz, xz + wy],
+                [xy + wz, 1.0 - (xx + zz), yz - wx],
+                [xz - wy, yz + wx, 1.0 - (xx + yy)],
+            ],
+            dtype=np.float64,
+        )
+
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if "rotation" not in data or "translation" not in data:
-        raise ValueError("transform json 必须包含 rotation 和 translation 字段")
+    if "rotation" in data and "translation" in data:
+        R = np.array(data["rotation"], dtype=np.float64)
+        t = np.array(data["translation"], dtype=np.float64).reshape(3)
+        if R.shape != (3, 3):
+            raise ValueError("rotation 必须是 3x3")
+        return R, t
 
-    R = np.array(data["rotation"], dtype=np.float64)
-    t = np.array(data["translation"], dtype=np.float64).reshape(3)
-    if R.shape != (3, 3):
-        raise ValueError("rotation 必须是 3x3")
-    return R, t
+    if "position" in data and "orientation" in data:
+        t = np.array(data["position"], dtype=np.float64).reshape(3)
+        q = np.array(data["orientation"], dtype=np.float64).reshape(4)
+        R = _quat_xyzw_to_rotmat(q)
+        return R, t
+
+    raise ValueError(
+        "transform json 必须包含 rotation/translation 或 position/orientation 字段"
+    )
 
 
 def attach_robot_xyz(
