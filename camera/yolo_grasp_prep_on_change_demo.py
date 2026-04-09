@@ -5,7 +5,7 @@ yolo_grasp_prep_on_change_demo.py
 在 yolo_grasp_prep_demo.py 基础上：
 1. 仅当「当前最佳目标」相对上一次已发布结果发生有意义变化时，才打印 [TARGET]（在 grasp_prep 格式上增加深度与相机坐标）
 2. 可选每隔 N 帧做一次 YOLO 推理（降低 GPU 占用；未推理帧沿用上次检测框叠画，快速运动时框可能略有偏差）
-3. 默认开启 **RGB + 深度**；在最佳目标中心邻域取深度（米），并换算为相机坐标 (X,Y,Z)m
+3. 默认开启 **RGB + 深度**；`--length-unit` 决定整条几何链单位。**mm** 时 SDK 深度在 `CameraManager` 内由原始值直接得到毫米（不经米）；手眼与 D2C 平移与之一致（标定文件用毫米填写）
 
 说明：
 - 延迟主要来自每帧 YOLO 推理与相机管线，而不是终端 print
@@ -122,16 +122,16 @@ def parse_args():
         help="cv2.waitKey 等待毫秒数（用于处理窗口事件；默认 1）",
     )
     parser.add_argument(
-        "--min-depth-m",
+        "--min-depth",
         type=float,
-        default=0.05,
-        help="深度有效下限（米），小于该值视为无效",
+        default=None,
+        help="深度有效下限，单位与 --length-unit 一致；省略时默认 0.05(m) 或 50(mm)",
     )
     parser.add_argument(
-        "--max-depth-m",
+        "--max-depth",
         type=float,
-        default=3.0,
-        help="深度有效上限（米），大于该值视为无效",
+        default=None,
+        help="深度有效上限，单位与 --length-unit 一致；省略时默认 3(m) 或 3000(mm)",
     )
     parser.add_argument(
         "--depth-mode",
@@ -156,13 +156,20 @@ def parse_args():
         "--camera-param-ini",
         type=str,
         default="",
-        help="Orbbec Viewer 导出的 CameraParam ini 路径（包含 Color/Depth 内参与 D2CTransformParam）。提供后将自动按 ini 的分辨率启动相机并用于 cam_xyz 计算。",
+        help="Orbbec CameraParam ini（Color/Depth 内参 + D2CTransformParam）。D2C 的 trans0..2 单位须与 --length-unit 一致。",
     )
     parser.add_argument(
         "--cam-to-base-json",
         type=str,
         default="",
-        help="手眼标定结果文件（JSON）：相机坐标到机械臂基坐标的刚体变换。支持两种格式：1) {'rotation':[[...],[...],[...]], 'translation':[tx,ty,tz]}；2) handeye_calibration_ros 输出 {'position':[tx,ty,tz], 'orientation':[qx,qy,qz,qw]}（单位: 米）。",
+        help="手眼标定 JSON：相机→基座。rotation 无单位；translation/position 的单位与 --length-unit 一致（毫米模式请填毫米）。",
+    )
+    parser.add_argument(
+        "--length-unit",
+        type=str,
+        default="m",
+        choices=["m", "mm"],
+        help="整条管线长度单位。mm：SDK 深度在 camera_manager 内直接输出毫米；D2C/手眼 JSON 的平移也用毫米。m：均为米。",
     )
     parser.add_argument(
         "--time-stat",
@@ -176,6 +183,10 @@ def parse_args():
         help="每 N 帧打印一次耗时统计（配合 --time-stat）",
     )
     return parser.parse_args()
+
+
+def length_suffix(unit: str) -> str:
+    return "mm" if unit == "mm" else "m"
 
 
 def map_rgb_uv_to_depth_uv(
@@ -205,15 +216,15 @@ def attach_depth_and_cam_xyz(
     d2c_R: Optional[np.ndarray],
     d2c_t: Optional[np.ndarray],
     cam: CameraManager,
-    min_depth_m: float = 0.05,
-    max_depth_m: float = 3.0,
+    min_depth: float,
+    max_depth: float,
     depth_mode: str = "bbox",
     depth_kernel: int = 7,
     depth_bbox_shrink: float = 0.25,
 ) -> Dict[str, Any]:
-    """为检测字典附加 depth_m 与 cam_x, cam_y, cam_z（米）。彩色与深度分辨率不同时对 (u,v) 做映射采样。"""
+    """附加 depth 与 cam_x/y/z；depth_image 单位与 CameraManager.depth_unit、min/max_depth 一致。"""
     out = det.copy()
-    out["depth_m"] = 0.0
+    out["depth"] = 0.0
     out["cam_x"] = 0.0
     out["cam_y"] = 0.0
     out["cam_z"] = 0.0
@@ -221,16 +232,18 @@ def attach_depth_and_cam_xyz(
     if depth_image is None:
         return out
 
+    dep = depth_image.astype(np.float64, copy=False)
+
     u, v = int(det["u"]), int(det["v"])
-    ud, vd = map_rgb_uv_to_depth_uv(u, v, rgb_shape, depth_image.shape)
+    ud, vd = map_rgb_uv_to_depth_uv(u, v, rgb_shape, dep.shape)
 
     # 更鲁棒的深度取样：优先 bbox 区域有效深度中位数
     z = 0.0
     if depth_mode == "bbox":
-        dh, dw = depth_image.shape[:2]
+        dh, dw = dep.shape[:2]
         x1, y1, x2, y2 = int(det["x1"]), int(det["y1"]), int(det["x2"]), int(det["y2"])
-        x1d, y1d = map_rgb_uv_to_depth_uv(x1, y1, rgb_shape, depth_image.shape)
-        x2d, y2d = map_rgb_uv_to_depth_uv(x2, y2, rgb_shape, depth_image.shape)
+        x1d, y1d = map_rgb_uv_to_depth_uv(x1, y1, rgb_shape, dep.shape)
+        x2d, y2d = map_rgb_uv_to_depth_uv(x2, y2, rgb_shape, dep.shape)
         xa, xb = (x1d, x2d) if x1d <= x2d else (x2d, x1d)
         ya, yb = (y1d, y2d) if y1d <= y2d else (y2d, y1d)
 
@@ -249,8 +262,8 @@ def attach_depth_and_cam_xyz(
         ya2 = int(round(ya + h * shrink))
         yb2 = int(round(yb - h * shrink))
         if xb2 > xa2 and yb2 > ya2:
-            patch = depth_image[ya2:yb2, xa2:xb2]
-            valid = patch[(patch > min_depth_m) & (patch < max_depth_m) & np.isfinite(patch)]
+            patch = dep[ya2:yb2, xa2:xb2]
+            valid = patch[(patch > min_depth) & (patch < max_depth) & np.isfinite(patch)]
             if valid.size > 0:
                 z = float(np.median(valid))
 
@@ -260,11 +273,11 @@ def attach_depth_and_cam_xyz(
             k = 1
         if k % 2 == 0:
             k += 1
-        z = float(cam.get_valid_depth_near_pixel(depth_image, ud, vd, kernel_size=k))
+        z = float(cam.get_valid_depth_near_pixel(dep, ud, vd, kernel_size=k))
     z = float(z)
-    if (not np.isfinite(z)) or (z < min_depth_m) or (z > max_depth_m):
+    if (not np.isfinite(z)) or (z < min_depth) or (z > max_depth):
         z = 0.0
-    out["depth_m"] = float(z)
+    out["depth"] = float(z)
 
     if z > 0 and np.isfinite(z):
         # Use depth intrinsics + depth pixel to compute 3D in depth camera coordinates.
@@ -287,7 +300,7 @@ def attach_depth_and_cam_xyz(
 
 def load_rigid_transform_json(path: str) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Load rigid transform from JSON.
+    Load rigid transform from JSON. translation / position 的单位由调用方与 --length-unit 约定（米或毫米）。
     Supported formats:
       1) rotation/translation:
          - rotation: 3x3 nested list
@@ -343,7 +356,7 @@ def attach_robot_xyz(
     cam_to_base_t: Optional[np.ndarray],
 ) -> Dict[str, Any]:
     """
-    在 det 中补充 robot_x/robot_y/robot_z（机械臂基坐标系，米）。
+    在 det 中补充 robot_x/y/z（基坐标系），单位与 cam_x/y/z 一致。
     """
     out = det.copy()
     out["robot_x"] = 0.0
@@ -372,6 +385,7 @@ def attach_robot_xyz(
 def load_camera_param_ini(path: str) -> Tuple[CameraIntrinsics, CameraIntrinsics, np.ndarray, np.ndarray]:
     """
     Parse Orbbec Viewer exported CameraParam ini.
+    D2CTransformParam trans0..2 的单位应与运行时 --length-unit 一致（米或毫米）。
     Returns: (color_intr, depth_intr, R(3,3), t(3,))
     """
     cp = configparser.ConfigParser()
@@ -486,6 +500,13 @@ def main():
     if args.waitkey_ms < 0:
         raise SystemExit("--waitkey-ms 必须 >= 0")
 
+    if args.min_depth is None:
+        args.min_depth = 50.0 if args.length_unit == "mm" else 0.05
+    if args.max_depth is None:
+        args.max_depth = 3000.0 if args.length_unit == "mm" else 3.0
+
+    len_suffix = length_suffix(args.length_unit)
+
     target_class_names = set()
     if args.classes.strip():
         target_class_names = {x.strip() for x in args.classes.split(",") if x.strip()}
@@ -501,6 +522,8 @@ def main():
         if not os.path.isabs(ini_path):
             ini_path = os.path.join(PROJECT_ROOT, ini_path)
         ini_color_intr, ini_depth_intr, d2c_R, d2c_t = load_camera_param_ini(ini_path)
+        if d2c_t is not None:
+            d2c_t = np.asarray(d2c_t, dtype=np.float64)
         print("[INFO] loaded camera param ini:", ini_path)
         print("[INFO] ini color intr:", ini_color_intr)
         print("[INFO] ini depth intr:", ini_depth_intr)
@@ -510,9 +533,10 @@ def main():
         if not os.path.isabs(tf_path):
             tf_path = os.path.join(PROJECT_ROOT, tf_path)
         cam_to_base_R, cam_to_base_t = load_rigid_transform_json(tf_path)
+        cam_to_base_t = np.asarray(cam_to_base_t, dtype=np.float64)
         print("[INFO] loaded hand-eye transform:", tf_path)
         print("[INFO] cam->base R:\n", cam_to_base_R)
-        print("[INFO] cam->base t:", cam_to_base_t)
+        print(f"[INFO] cam->base t ({len_suffix}):", cam_to_base_t)
 
     print(f"[INFO] loading model: {args.model}")
     try:
@@ -541,6 +565,7 @@ def main():
         enable_depth=use_depth,
         align_to_color=args.align_to_color,
         latest_only=True,
+        depth_unit=args.length_unit,
     )
 
     prev_time = time.time()
@@ -564,6 +589,15 @@ def main():
         )
         print("[INFO] intrinsics(color):", intr_color)
         print("[INFO] intrinsics(depth):", intr_depth)
+        print(f"[INFO] length unit: {len_suffix} (depth / cam_xyz / base_xyz / thresholds)")
+        print(f"[INFO] depth valid range: [{args.min_depth:g}, {args.max_depth:g}] {len_suffix}")
+        if use_depth:
+            print(
+                "[INFO] SDK depth stored as",
+                "mm (uint16 × depth_scale × 1000, no meter buffer)"
+                if args.length_unit == "mm"
+                else "m (uint16 × depth_scale)",
+            )
         print("[INFO] depth stream:", "on" if use_depth else "off (--no-depth)")
 
         window_name = "YOLO Grasp Prep (on change)"
@@ -660,8 +694,8 @@ def main():
                     d2c_R,
                     d2c_t,
                     cam,
-                    min_depth_m=args.min_depth_m,
-                    max_depth_m=args.max_depth_m,
+                    min_depth=args.min_depth,
+                    max_depth=args.max_depth,
                     depth_mode=args.depth_mode,
                     depth_kernel=args.depth_kernel,
                     depth_bbox_shrink=args.depth_bbox_shrink,
@@ -692,7 +726,8 @@ def main():
                 if use_depth:
                     safe_put_text(
                         vis,
-                        f'Z={best_e["depth_m"]:.3f}m  cam=({best_e["cam_x"]:.3f},{best_e["cam_y"]:.3f},{best_e["cam_z"]:.3f})',
+                        f'Z={best_e["depth"]:.3f}{len_suffix}  '
+                        f'cam=({best_e["cam_x"]:.3f},{best_e["cam_y"]:.3f},{best_e["cam_z"]:.3f})',
                         (20, 120),
                         0.55,
                         2,
@@ -718,10 +753,10 @@ def main():
                             f'conf={best_e["conf"]:.3f}, '
                             f'pixel=({best_e["u"]}, {best_e["v"]}), '
                             f'bbox=({best_e["x1"]}, {best_e["y1"]}, {best_e["x2"]}, {best_e["y2"]}), '
-                            f'depth_m={best_e["depth_m"]:.3f}, '
-                            f'cam_xyz=({best_e["cam_x"]:.4f}, {best_e["cam_y"]:.4f}, {best_e["cam_z"]:.4f})'
+                            f'depth_{len_suffix}={best_e["depth"]:.3f}, '
+                            f'cam_xyz_{len_suffix}=({best_e["cam_x"]:.4f}, {best_e["cam_y"]:.4f}, {best_e["cam_z"]:.4f})'
                             + (
-                                f', base_xyz=({best_e["robot_x"]:.4f}, {best_e["robot_y"]:.4f}, {best_e["robot_z"]:.4f})'
+                                f', base_xyz_{len_suffix}=({best_e["robot_x"]:.4f}, {best_e["robot_y"]:.4f}, {best_e["robot_z"]:.4f})'
                                 if (cam_to_base_R is not None and cam_to_base_t is not None)
                                 else ""
                             )
@@ -759,11 +794,11 @@ def main():
 
             saved_y = 155 if use_depth else 130
             if saved_target is not None:
-                if use_depth and "depth_m" in saved_target:
+                if use_depth and "depth" in saved_target:
                     safe_put_text(
                         vis,
                         f'SAVED: {saved_target["class_name"]} @ ({saved_target["u"]}, {saved_target["v"]}) '
-                        f'Z={saved_target["depth_m"]:.3f}m',
+                        f'Z={saved_target["depth"]:.3f}{len_suffix}',
                         (20, saved_y),
                         0.65,
                         2,
@@ -786,7 +821,9 @@ def main():
                 if frame_index % args.display_every == 0:
                     cv2.imshow(window_name, vis)
                     if args.show_depth_panel and use_depth and depth_img is not None:
-                        dvis = CameraManager.depth_to_colormap(depth_img)
+                        dvis = CameraManager.depth_to_colormap(
+                            depth_img, max_depth=args.max_depth, depth_unit=args.length_unit
+                        )
                         if dvis.shape[0] != vis.shape[0]:
                             scale = vis.shape[0] / max(dvis.shape[0], 1)
                             nw = max(1, int(dvis.shape[1] * scale))
@@ -809,8 +846,8 @@ def main():
                         d2c_R,
                         d2c_t,
                         cam,
-                        min_depth_m=args.min_depth_m,
-                        max_depth_m=args.max_depth_m,
+                        min_depth=args.min_depth,
+                        max_depth=args.max_depth,
                         depth_mode=args.depth_mode,
                         depth_kernel=args.depth_kernel,
                         depth_bbox_shrink=args.depth_bbox_shrink,
@@ -823,10 +860,10 @@ def main():
                             f'class={saved_target["class_name"]}, '
                             f'pixel=({saved_target["u"]}, {saved_target["v"]}), '
                             f'bbox=({saved_target["x1"]}, {saved_target["y1"]}, {saved_target["x2"]}, {saved_target["y2"]}), '
-                            f'depth_m={saved_target["depth_m"]:.3f}, '
-                            f'cam_xyz=({saved_target["cam_x"]:.4f}, {saved_target["cam_y"]:.4f}, {saved_target["cam_z"]:.4f})'
+                            f'depth_{len_suffix}={saved_target["depth"]:.3f}, '
+                            f'cam_xyz_{len_suffix}=({saved_target["cam_x"]:.4f}, {saved_target["cam_y"]:.4f}, {saved_target["cam_z"]:.4f})'
                             + (
-                                f', base_xyz=({saved_target["robot_x"]:.4f}, {saved_target["robot_y"]:.4f}, {saved_target["robot_z"]:.4f})'
+                                f', base_xyz_{len_suffix}=({saved_target["robot_x"]:.4f}, {saved_target["robot_y"]:.4f}, {saved_target["robot_z"]:.4f})'
                                 if (cam_to_base_R is not None and cam_to_base_t is not None)
                                 else ""
                             )

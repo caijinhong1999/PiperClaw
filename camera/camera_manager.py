@@ -9,6 +9,7 @@ camera_manager.py
 4. 为后续单独调通 depth 保留接口
 5. 对内参获取失败做兜底，避免程序中断
 6. latest_only=True 时由后台线程独占 wait_for_frames，只保留最新帧，减轻「队列满丢帧」
+7. depth_unit='mm' 时深度帧由原始 uint16 × (SDK 深度尺度[m/单位] × 1000) 直接得到毫米，不经米制数组
 
 运行：
     python camera/camera_manager.py
@@ -90,7 +91,10 @@ class CameraManager:
         device_index: int = 0,
         auto_start: bool = False,
         latest_only: bool = False,
+        depth_unit: str = "m",
     ) -> None:
+        if depth_unit not in ("m", "mm"):
+            raise ValueError("depth_unit 必须是 'm' 或 'mm'")
         self.color_width = color_width
         self.color_height = color_height
         self.color_fps = color_fps
@@ -102,6 +106,7 @@ class CameraManager:
         self.align_to_color = align_to_color
         self.device_index = device_index
         self._latest_only = latest_only
+        self._depth_unit = depth_unit
 
         self._ctx = None
         self._pipeline = None
@@ -360,7 +365,10 @@ class CameraManager:
             try:
                 depth_frame = frames.get_depth_frame()
                 if depth_frame is not None:
-                    depth_image = self._convert_depth_frame_to_meters(depth_frame)
+                    if self._depth_unit == "mm":
+                        depth_image = self._convert_depth_frame_to_mm(depth_frame)
+                    else:
+                        depth_image = self._convert_depth_frame_to_meters(depth_frame)
                     depth_ts = self._safe_get_timestamp(depth_frame)
             except Exception as e:
                 raise CameraError(f"解析深度帧失败: {e}") from e
@@ -839,7 +847,7 @@ class CameraManager:
             vis.append(rgb)
 
         if depth is not None and show_depth_colormap:
-            depth_vis = self.depth_to_colormap(depth)
+            depth_vis = self.depth_to_colormap(depth, depth_unit=self._depth_unit)
             vis.append(depth_vis)
 
         if len(vis) == 1:
@@ -858,11 +866,21 @@ class CameraManager:
         cv2.destroyWindow(window_name)
 
     @staticmethod
-    def depth_to_colormap(depth_meters: np.ndarray, max_depth: float = 2.0) -> np.ndarray:
-        depth = depth_meters.copy()
-        depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-        depth = np.clip(depth, 0, max_depth)
-        depth_u8 = (depth / max_depth * 255.0).astype(np.uint8)
+    def depth_to_colormap(
+        depth: np.ndarray,
+        max_depth: Optional[float] = None,
+        *,
+        depth_unit: str = "m",
+    ) -> np.ndarray:
+        """
+        depth 与 depth_unit 一致：m 时 max_depth 默认约 2m；mm 时默认约 2000mm。
+        """
+        if max_depth is None:
+            max_depth = 2000.0 if depth_unit == "mm" else 2.0
+        d = depth.copy()
+        d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+        d = np.clip(d, 0, max_depth)
+        depth_u8 = (d / max_depth * 255.0).astype(np.uint8)
         color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
         return color
 
@@ -1044,6 +1062,26 @@ class CameraManager:
         scale = self._depth_scale_from_frame(depth_frame)
         depth_m = depth_raw.astype(np.float32) * scale
         return depth_m
+
+    def _convert_depth_frame_to_mm(self, depth_frame: Any) -> np.ndarray:
+        """
+        由原始 uint16 与 SDK 深度尺度直接得到毫米，不经过米制中间数组。
+        depth_mm = raw * scale_m * 1000
+        """
+        width = int(depth_frame.get_width())
+        height = int(depth_frame.get_height())
+        data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
+
+        expected = width * height
+        if data.size != expected:
+            raise CameraError(
+                f"深度帧数据长度异常，expected={expected}, actual={data.size}"
+            )
+
+        depth_raw = data.reshape((height, width))
+        scale_m = self._depth_scale_from_frame(depth_frame)
+        scale_mm = float(scale_m) * 1000.0
+        return depth_raw.astype(np.float32) * scale_mm
 
     def _depth_scale_from_frame(self, depth_frame: Any) -> float:
         if self._depth_scale is not None:
